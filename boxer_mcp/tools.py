@@ -136,3 +136,57 @@ async def box_queue_status() -> dict[str, Any]:
 async def box_cleanup_plan() -> dict[str, Any]:
     """List stale VMs that can be cleaned up in the current project."""
     return await ipc("cleanup.plan", {})
+
+
+@mcp.tool()
+async def box_scan_unmanaged() -> dict[str, Any]:
+    """Scan for QEMU/KVM VMs not tracked by Boxer.
+
+    Returns three lists:
+    - orphaned_boxer: Boxer-- domains whose DB record was lost (crash/reinstall). Use box_adopt_vm.
+    - foreign_vms: pre-existing non-Boxer domains. Use box_import_vm.
+    - ghost_records: DB records whose libvirt domain no longer exists. Use box_purge_ghost.
+
+    Each item includes a suggested_action field. Run this first when adding Boxer to
+    a workspace that already has running VMs.
+    """
+    return await ipc("vm.scan", {})
+
+
+@mcp.tool()
+async def box_import_vm(
+    libvirt_name: Annotated[str, "Exact libvirt domain name to import (from box_scan_unmanaged foreign_vms)"],
+    display_name: Annotated[Optional[str], "Human-readable name; defaults to the domain name"] = None,
+    ttl_minutes: Annotated[int, "Lease duration in minutes before VM is marked stale"] = 60,
+) -> dict[str, Any]:
+    """Import a foreign (pre-existing) libvirt domain into Boxer management for this project.
+
+    Non-destructive: the domain is not renamed and its storage is not moved.
+    Boxer will NOT auto-delete this VM's storage on lease expiry or vm.delete.
+    """
+    params: dict[str, Any] = {"libvirt_name": libvirt_name, "ttl_minutes": ttl_minutes}
+    if display_name:
+        params["display_name"] = display_name
+    return await ipc("vm.import", params)
+
+
+@mcp.tool()
+async def box_adopt_vm(
+    libvirt_name: Annotated[str, "Boxer-- domain name to re-adopt (from box_scan_unmanaged orphaned_boxer)"],
+) -> dict[str, Any]:
+    """Re-adopt an orphaned Boxer-- domain whose DB record was lost (daemon crash, DB wipe, reinstall).
+
+    The domain name encodes the original project_id and vm_id — no rename or storage move needed.
+    """
+    return await ipc("vm.adopt", {"libvirt_name": libvirt_name})
+
+
+@mcp.tool()
+async def box_purge_ghost(
+    vm_id: Annotated[str, "VM ID of the ghost DB record to remove (from box_scan_unmanaged ghost_records)"],
+) -> dict[str, Any]:
+    """Remove a ghost DB record for a VM whose libvirt domain no longer exists.
+
+    Fails safely if the domain still exists in libvirt — use box_delete_vm in that case.
+    """
+    return await ipc("vm.purge_ghost", {"vm_id": vm_id})

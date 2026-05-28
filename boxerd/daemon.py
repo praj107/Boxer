@@ -20,6 +20,7 @@ from boxerd.ipc_server import IPCServer
 from boxerd.lease_manager import LeaseManager
 from boxerd.network_ops import NetworkManager
 from boxerd.policy import PolicyEngine, caller_from_params
+from boxerd.reconcile import build_reconcile_report, parse_boxer_name, _extract_disk_path, _get_disk_size_gb
 from boxerd.scheduler import HostCapacity, Scheduler
 from boxerd.storage_ops import StorageManager
 from boxerd.vm_ops import VMOperations
@@ -109,6 +110,10 @@ class BoxerDaemon:
         reg("queue.status", self._h_queue_status)
         reg("cleanup.plan", self._h_cleanup_plan)
         reg("event.poll", self._h_event_poll)
+        reg("vm.scan", self._h_vm_scan)
+        reg("vm.import", self._h_vm_import)
+        reg("vm.adopt", self._h_vm_adopt)
+        reg("vm.purge_ghost", self._h_vm_purge_ghost)
 
         self._server.register_notify("event.poll", self._h_event_poll)
 
@@ -326,7 +331,8 @@ class BoxerDaemon:
         await self._db.update_vm_state(vm_id, "deleting")
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._vm_ops.undefine, vm.libvirt_name)
-        self._storage.delete_vm_storage(vm.project_id, vm_id)
+        if vm.origin == "boxer":
+            self._storage.delete_vm_storage(vm.project_id, vm_id)
         await self._db.delete_vm(vm_id)
 
         if not self._network.has_active_vms(vm.project_id):
@@ -488,6 +494,210 @@ class BoxerDaemon:
         ]
 
 
+    # ------------------------------------------------------------------ vm.scan
+
+    async def _h_vm_scan(self, params: dict[str, Any]) -> dict[str, Any]:
+        report = await build_reconcile_report(self._conn, self._db)
+        return {
+            "orphaned_boxer": [
+                {
+                    "libvirt_name": o.libvirt_name,
+                    "parsed_project_id": o.parsed_project_id,
+                    "parsed_display_name": o.parsed_display_name,
+                    "parsed_vm_id": o.parsed_vm_id,
+                    "disk_path": o.disk_path,
+                    "disk_gb": o.disk_gb,
+                    "is_active": o.is_active,
+                    "suggested_action": o.suggested_action,
+                }
+                for o in report.orphaned_boxer
+            ],
+            "foreign_vms": [
+                {
+                    "libvirt_name": f.libvirt_name,
+                    "disk_path": f.disk_path,
+                    "disk_gb": f.disk_gb,
+                    "is_active": f.is_active,
+                    "suggested_action": f.suggested_action,
+                }
+                for f in report.foreign_vms
+            ],
+            "ghost_records": [
+                {
+                    "vm_id": g.vm_id,
+                    "libvirt_name": g.libvirt_name,
+                    "project_id": g.project_id,
+                    "display_name": g.display_name,
+                    "suggested_action": g.suggested_action,
+                }
+                for g in report.ghost_records
+            ],
+        }
+
+    # ------------------------------------------------------------------ vm.import
+
+    async def _h_vm_import(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        libvirt_name = params.get("libvirt_name")
+        if not libvirt_name:
+            raise IPCError(ERR_INVALID_PARAMS, "libvirt_name required")
+
+        display_name = params.get("display_name") or libvirt_name
+        ttl_minutes = int(params.get("ttl_minutes", self._cfg.default_ttl_minutes))
+        project_id = params.get("project_id") or caller.project_id
+
+        loop = asyncio.get_running_loop()
+        try:
+            xml = await loop.run_in_executor(
+                None, lambda: self._conn.lookupByName(libvirt_name).XMLDesc(0)
+            )
+        except libvirt.libvirtError:
+            raise IPCError(ERR_NOT_FOUND, f"Domain '{libvirt_name}' not found in libvirt")
+
+        existing = await self._db.get_vm_by_libvirt_name(libvirt_name)
+        if existing is not None:
+            raise IPCError(
+                ERR_INVALID_PARAMS,
+                f"Domain '{libvirt_name}' is already tracked as vm_id={existing.id}",
+            )
+
+        disk_path = _extract_disk_path(xml)
+        disk_gb = 0
+        if disk_path:
+            disk_gb = await loop.run_in_executor(None, _get_disk_size_gb, disk_path)
+
+        vm_id = _make_vm_id()
+        now = datetime.now(timezone.utc)
+        vm = VMRecord(
+            id=vm_id,
+            libvirt_name=libvirt_name,
+            project_id=project_id,
+            display_name=display_name,
+            state="running",
+            owner_user=caller.user,
+            template="imported",
+            cpu=0,
+            ram_mb=0,
+            disk_gb=disk_gb,
+            headless=True,
+            created_at=now,
+            last_touched=now,
+            lease_until=now + timedelta(minutes=ttl_minutes),
+            origin="imported",
+        )
+        await self._db.upsert_project(project_id, "unknown")
+        await self._db.insert_vm(vm)
+        await self._db.add_event(
+            "INFO",
+            f"Imported foreign VM '{libvirt_name}' as '{display_name}' ({vm_id})",
+            project_id=project_id,
+            vm_id=vm_id,
+        )
+        return _vm_to_dict(vm)
+
+    # ------------------------------------------------------------------ vm.adopt
+
+    async def _h_vm_adopt(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        libvirt_name = params.get("libvirt_name")
+        if not libvirt_name:
+            raise IPCError(ERR_INVALID_PARAMS, "libvirt_name required")
+
+        parsed = parse_boxer_name(libvirt_name)
+        if parsed is None:
+            raise IPCError(
+                ERR_INVALID_PARAMS,
+                f"'{libvirt_name}' does not match Boxer--<project>--<name>--<vm_id> pattern",
+            )
+        project_id, display_name, vm_id = parsed
+
+        loop = asyncio.get_running_loop()
+        try:
+            xml = await loop.run_in_executor(
+                None, lambda: self._conn.lookupByName(libvirt_name).XMLDesc(0)
+            )
+        except libvirt.libvirtError:
+            raise IPCError(ERR_NOT_FOUND, f"Domain '{libvirt_name}' not found in libvirt")
+
+        existing = await self._db.get_vm(vm_id)
+        if existing is not None:
+            raise IPCError(
+                ERR_INVALID_PARAMS,
+                f"vm_id '{vm_id}' is already tracked in DB",
+            )
+
+        disk_path = _extract_disk_path(xml)
+        disk_gb = 0
+        if disk_path:
+            disk_gb = await loop.run_in_executor(None, _get_disk_size_gb, disk_path)
+
+        now = datetime.now(timezone.utc)
+        vm = VMRecord(
+            id=vm_id,
+            libvirt_name=libvirt_name,
+            project_id=project_id,
+            display_name=display_name,
+            state="running",
+            owner_user=caller.user,
+            template="adopted",
+            cpu=0,
+            ram_mb=0,
+            disk_gb=disk_gb,
+            headless=True,
+            created_at=now,
+            last_touched=now,
+            lease_until=now + timedelta(minutes=self._cfg.default_ttl_minutes),
+            origin="adopted",
+        )
+        await self._db.upsert_project(project_id, "unknown")
+        await self._db.insert_vm(vm)
+        await self._db.add_event(
+            "INFO",
+            f"Adopted orphaned Boxer domain '{libvirt_name}' (vm_id={vm_id})",
+            project_id=project_id,
+            vm_id=vm_id,
+        )
+        return _vm_to_dict(vm)
+
+    # ------------------------------------------------------------------ vm.purge_ghost
+
+    async def _h_vm_purge_ghost(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        vm_id = params.get("vm_id")
+        if not vm_id:
+            raise IPCError(ERR_INVALID_PARAMS, "vm_id required")
+
+        vm = await self._db.get_vm(vm_id)
+        if vm is None:
+            raise IPCError(ERR_NOT_FOUND, f"vm_id '{vm_id}' not found in DB")
+
+        self._policy.check("vm.purge_ghost", caller, vm)
+
+        loop = asyncio.get_running_loop()
+        def _domain_exists(name: str) -> bool:
+            try:
+                self._conn.lookupByName(name)
+                return True
+            except libvirt.libvirtError:
+                return False
+
+        still_alive = await loop.run_in_executor(None, _domain_exists, vm.libvirt_name)
+        if still_alive:
+            raise IPCError(
+                ERR_INVALID_PARAMS,
+                f"Domain '{vm.libvirt_name}' still exists in libvirt — use vm.delete instead",
+            )
+
+        await self._db.purge_ghost_record(vm_id)
+        await self._db.add_event(
+            "INFO",
+            f"Purged ghost DB record for '{vm.display_name}' ({vm_id})",
+            project_id=vm.project_id,
+            vm_id=vm_id,
+        )
+        return {"vm_id": vm_id, "purged": True}
+
+
 def _vm_to_dict(vm: VMRecord) -> dict[str, Any]:
     return {
         "vm_id": vm.id,
@@ -506,4 +716,5 @@ def _vm_to_dict(vm: VMRecord) -> dict[str, Any]:
         "last_touched": vm.last_touched.isoformat(),
         "lease_until": vm.lease_until.isoformat(),
         "tags": vm.tags,
+        "origin": vm.origin,
     }

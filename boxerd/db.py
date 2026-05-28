@@ -101,6 +101,7 @@ def _vm_from_row(row: aiosqlite.Row, tags: dict[str, str]) -> VMRecord:
         last_touched=_parse_dt(row["last_touched"]),
         lease_until=_parse_dt(row["lease_until"]),
         tags=tags,
+        origin=row["origin"] if "origin" in row.keys() else "boxer",
     )
 
 
@@ -115,6 +116,14 @@ class Database:
         self._db.row_factory = aiosqlite.Row
         await self._db.executescript(_SCHEMA)
         await self._db.commit()
+        # Idempotent migration: add 'origin' column for existing DBs
+        try:
+            await self._db.execute(
+                "ALTER TABLE vms ADD COLUMN origin TEXT NOT NULL DEFAULT 'boxer'"
+            )
+            await self._db.commit()
+        except Exception:
+            pass  # Column already exists
 
     async def close(self) -> None:
         if self._db:
@@ -143,13 +152,15 @@ class Database:
         async with self._conn() as db:
             await db.execute(
                 """INSERT INTO vms(id,libvirt_name,project_id,display_name,state,owner_user,
-                   template,cpu,ram_mb,disk_gb,headless,ip_address,created_at,last_touched,lease_until)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   template,cpu,ram_mb,disk_gb,headless,ip_address,created_at,last_touched,
+                   lease_until,origin)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     vm.id, vm.libvirt_name, vm.project_id, vm.display_name, vm.state,
                     vm.owner_user, vm.template, vm.cpu, vm.ram_mb, vm.disk_gb,
                     int(vm.headless), vm.ip_address,
-                    vm.created_at.isoformat(), vm.last_touched.isoformat(), vm.lease_until.isoformat(),
+                    vm.created_at.isoformat(), vm.last_touched.isoformat(),
+                    vm.lease_until.isoformat(), vm.origin,
                 ),
             )
             for k, v in vm.tags.items():
@@ -212,6 +223,23 @@ class Database:
             await db.commit()
 
     async def delete_vm(self, vm_id: str) -> None:
+        async with self._conn() as db:
+            await db.execute("DELETE FROM vms WHERE id=?", (vm_id,))
+            await db.commit()
+
+    async def get_vm_by_libvirt_name(self, libvirt_name: str) -> Optional[VMRecord]:
+        async with self._conn() as db:
+            async with db.execute(
+                "SELECT * FROM vms WHERE libvirt_name=?", (libvirt_name,)
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                return None
+            tags = await self._get_tags(db, row["id"])
+            return _vm_from_row(row, tags)
+
+    async def purge_ghost_record(self, vm_id: str) -> None:
+        """Delete a DB record for a VM whose libvirt domain is confirmed absent."""
         async with self._conn() as db:
             await db.execute("DELETE FROM vms WHERE id=?", (vm_id,))
             await db.commit()

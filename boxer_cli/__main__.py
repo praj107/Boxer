@@ -194,5 +194,134 @@ def status() -> None:
     click.echo(f"Running Boxer VMs: {s['running_vms']}")
 
 
+@cli.command("scan")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON")
+def scan(as_json: bool) -> None:
+    """List all unmanaged libvirt domains and ghost DB records (read-only)."""
+    report = _run(_call("vm.scan", {}))
+    if as_json:
+        click.echo(json.dumps(report, indent=2))
+        return
+
+    orphaned = report.get("orphaned_boxer", [])
+    foreign = report.get("foreign_vms", [])
+    ghosts = report.get("ghost_records", [])
+
+    if not orphaned and not foreign and not ghosts:
+        click.echo("All domains are accounted for — nothing to reconcile.")
+        return
+
+    if orphaned:
+        click.echo(f"\nOrphaned Boxer domains ({len(orphaned)}) — run 'boxer adopt <name>' to recover:")
+        for o in orphaned:
+            active = "running" if o.get("is_active") else "stopped"
+            click.echo(f"  {o['libvirt_name']}  project={o['parsed_project_id']}  {active}  disk={o['disk_gb']}G")
+
+    if foreign:
+        click.echo(f"\nForeign (unmanaged) domains ({len(foreign)}) — run 'boxer import <name>' to manage:")
+        for f in foreign:
+            active = "running" if f.get("is_active") else "stopped"
+            click.echo(f"  {f['libvirt_name']}  {active}  disk={f['disk_gb']}G")
+
+    if ghosts:
+        click.echo(f"\nGhost DB records ({len(ghosts)}) — run 'boxer reconcile --fix' to purge:")
+        for g in ghosts:
+            click.echo(f"  {g['vm_id']}  libvirt_name={g['libvirt_name']}  project={g['project_id']}")
+
+
+@cli.command("reconcile")
+@click.option("--fix", is_flag=True, help="Auto-adopt Boxer orphans and purge ghost DB records")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON (implies dry-run)")
+def reconcile(fix: bool, as_json: bool) -> None:
+    """Bidirectional reconciliation report. Use --fix to apply safe automated changes."""
+    report = _run(_call("vm.scan", {}))
+
+    if as_json:
+        click.echo(json.dumps(report, indent=2))
+        return
+
+    orphaned = report.get("orphaned_boxer", [])
+    foreign = report.get("foreign_vms", [])
+    ghosts = report.get("ghost_records", [])
+
+    click.echo(f"Orphaned Boxer domains : {len(orphaned)}")
+    click.echo(f"Foreign domains        : {len(foreign)}")
+    click.echo(f"Ghost DB records       : {len(ghosts)}")
+
+    if not fix:
+        if orphaned:
+            click.echo("\n[DRY RUN] Would auto-adopt:")
+            for o in orphaned:
+                click.echo(f"  boxer adopt {o['libvirt_name']}")
+        if ghosts:
+            click.echo("\n[DRY RUN] Would purge ghost records:")
+            for g in ghosts:
+                click.echo(f"  boxer purge-ghost {g['vm_id']}  ({g['libvirt_name']})")
+        if foreign:
+            click.echo("\n[INFO] Foreign domains require manual import:")
+            for f in foreign:
+                click.echo(f"  boxer import {f['libvirt_name']}")
+        if not orphaned and not ghosts and not foreign:
+            click.echo("\nNothing to reconcile.")
+        return
+
+    # --fix: adopt orphans and purge ghosts; foreign domains always require manual import
+    for o in orphaned:
+        try:
+            result = _run(_call("vm.adopt", {"libvirt_name": o["libvirt_name"]}))
+            click.echo(f"Adopted  {o['libvirt_name']} → vm_id={result['vm_id']}")
+        except Exception as exc:
+            click.echo(f"Failed to adopt {o['libvirt_name']}: {exc}", err=True)
+
+    for g in ghosts:
+        try:
+            _run(_call("vm.purge_ghost", {"vm_id": g["vm_id"]}))
+            click.echo(f"Purged   {g['vm_id']}  ({g['libvirt_name']})")
+        except Exception as exc:
+            click.echo(f"Failed to purge {g['vm_id']}: {exc}", err=True)
+
+    if foreign:
+        click.echo(f"\n{len(foreign)} foreign domain(s) still require manual 'boxer import <name>'.")
+
+
+@cli.command("import")
+@click.argument("domain")
+@click.option("--project", "project_id", default="p_imported", show_default=True,
+              help="Target project ID")
+@click.option("--display", "display_name", default=None, help="Human-readable VM name")
+@click.option("--ttl", "ttl_minutes", default=None, type=int, help="Lease duration in minutes")
+@click.option("--yes", is_flag=True, help="Skip confirmation prompt")
+def import_vm(domain: str, project_id: str, display_name: Optional[str],
+              ttl_minutes: Optional[int], yes: bool) -> None:
+    """Import a foreign libvirt domain into Boxer management (non-destructive)."""
+    if not yes:
+        click.confirm(
+            f"Import '{domain}' into project '{project_id}'?\n"
+            "  Storage will NOT be moved or deleted by Boxer.",
+            abort=True,
+        )
+    params: dict[str, Any] = {"libvirt_name": domain, "project_id": project_id}
+    if display_name:
+        params["display_name"] = display_name
+    if ttl_minutes is not None:
+        params["ttl_minutes"] = ttl_minutes
+    result = _run(_call("vm.import", params))
+    click.echo(
+        f"Imported '{domain}' as vm_id={result['vm_id']}  "
+        f"display='{result['display_name']}'  project={result['project_id']}"
+    )
+
+
+@cli.command("adopt")
+@click.argument("domain")
+@click.option("--yes", is_flag=True, help="Skip confirmation prompt")
+def adopt(domain: str, yes: bool) -> None:
+    """Re-adopt an orphaned Boxer-- domain whose DB record was lost."""
+    if not yes:
+        click.confirm(f"Re-adopt orphaned domain '{domain}'?", abort=True)
+    result = _run(_call("vm.adopt", {"libvirt_name": domain}))
+    click.echo(f"Adopted '{domain}' → vm_id={result['vm_id']}")
+
+
 if __name__ == "__main__":
     cli()

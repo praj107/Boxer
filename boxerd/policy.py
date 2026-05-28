@@ -19,6 +19,7 @@ _OWNERSHIP_REQUIRED_ACTIONS = {
     "vm.exec",
     "vm.screenshot",
     "vm.input",
+    "vm.purge_ghost",
 }
 
 # Actions that are always blocked unless admin

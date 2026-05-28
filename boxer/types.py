@@ -23,6 +23,7 @@ class VMRecord:
     lease_until: datetime
     ip_address: Optional[str] = None
     tags: dict[str, str] = field(default_factory=dict)
+    origin: str = "boxer"  # 'boxer' | 'imported' | 'adopted'
 
 
 @dataclass
