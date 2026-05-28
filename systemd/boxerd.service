@@ -1,0 +1,29 @@
+[Unit]
+Description=Boxer QEMU/KVM VM daemon
+After=network.target libvirtd.service
+Requires=libvirtd.service
+
+[Service]
+Type=simple
+User=root
+Group=libvirt
+ExecStart=/usr/bin/python3 -m boxerd
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=boxer
+RuntimeDirectoryMode=0750
+StateDirectory=boxer
+StateDirectoryMode=0750
+
+# Prevent unbounded resource use by the daemon itself
+MemoryMax=512M
+TasksMax=64
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/boxer /run/boxer
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,509 @@
+"""Boxerd main daemon: wires all components and registers IPC handlers."""
+from __future__ import annotations
+
+import asyncio
+import logging
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
+
+import libvirt
+
+from boxer.config import BoxerConfig, get_config
+from boxer.ipc import ERR_INVALID_PARAMS, ERR_NOT_FOUND, IPCError
+from boxer.types import VMRecord
+from boxerd.cloud_init import CloudInitBuilder
+from boxerd.db import Database
+from boxerd.guest_agent import GuestAgent
+from boxerd.image_catalog import ImageManager
+from boxerd.ipc_server import IPCServer
+from boxerd.lease_manager import LeaseManager
+from boxerd.network_ops import NetworkManager
+from boxerd.policy import PolicyEngine, caller_from_params
+from boxerd.scheduler import HostCapacity, Scheduler
+from boxerd.storage_ops import StorageManager
+from boxerd.vm_ops import VMOperations
+
+logger = logging.getLogger(__name__)
+
+
+def _make_vm_id() -> str:
+    return "vm_" + uuid.uuid4().hex[:6]
+
+
+def _make_libvirt_name(project_id: str, display_name: str, vm_id: str) -> str:
+    safe = "".join(c if c.isalnum() or c == "-" else "-" for c in display_name)[:30]
+    return f"Boxer--{project_id}--{safe}--{vm_id}"
+
+
+class BoxerDaemon:
+    def __init__(self, cfg: Optional[BoxerConfig] = None):
+        self._cfg = cfg or get_config()
+        self._conn: Optional[libvirt.virConnect] = None
+        self._db = Database(self._cfg.db_path)
+        self._server = IPCServer(self._cfg.socket_path, self._cfg.notify_socket_path)
+        self._policy = PolicyEngine()
+        self._image_manager: Optional[ImageManager] = None
+        self._storage: Optional[StorageManager] = None
+        self._network: Optional[NetworkManager] = None
+        self._vm_ops: Optional[VMOperations] = None
+        self._guest: Optional[GuestAgent] = None
+        self._capacity: Optional[HostCapacity] = None
+        self._scheduler: Optional[Scheduler] = None
+        self._lease_manager: Optional[LeaseManager] = None
+        self._cloud_init = CloudInitBuilder()
+
+    async def start(self) -> None:
+        logger.info("BoxerD starting")
+        self._conn = libvirt.open(self._cfg.libvirt_uri)
+        if self._conn is None:
+            raise RuntimeError(f"Failed to connect to libvirt at {self._cfg.libvirt_uri}")
+
+        await self._db.open()
+
+        self._image_manager = ImageManager(self._cfg)
+        self._storage = StorageManager(self._conn, self._cfg)
+        self._network = NetworkManager(self._conn, self._cfg)
+        self._vm_ops = VMOperations(self._conn, self._cfg)
+        self._guest = GuestAgent(self._conn, self._cfg)
+        self._capacity = HostCapacity(self._conn, self._cfg)
+        self._scheduler = Scheduler(
+            self._db, self._capacity, self._create_vm_from_request, self._cfg
+        )
+        self._lease_manager = LeaseManager(self._db, self._vm_ops, self._storage, self._cfg)
+
+        self._storage.ensure_pool()
+        self._register_handlers()
+
+        await self._server.start()
+        self._scheduler.start_queue_runner()
+        self._lease_manager.start()
+
+        logger.info("BoxerD ready")
+
+    async def stop(self) -> None:
+        if self._lease_manager:
+            await self._lease_manager.stop()
+        if self._scheduler:
+            await self._scheduler.stop()
+        await self._server.stop()
+        await self._db.close()
+        if self._conn:
+            self._conn.close()
+        logger.info("BoxerD stopped")
+
+    def _register_handlers(self) -> None:
+        reg = self._server.register
+        reg("vm.request", self._h_vm_request)
+        reg("vm.list", self._h_vm_list)
+        reg("vm.get", self._h_vm_get)
+        reg("vm.start", self._h_vm_start)
+        reg("vm.stop", self._h_vm_stop)
+        reg("vm.delete", self._h_vm_delete)
+        reg("vm.extend_lease", self._h_vm_extend_lease)
+        reg("vm.snapshot", self._h_vm_snapshot)
+        reg("vm.exec", self._h_vm_exec)
+        reg("vm.screenshot", self._h_vm_screenshot)
+        reg("vm.input", self._h_vm_input)
+        reg("resource.status", self._h_resource_status)
+        reg("queue.status", self._h_queue_status)
+        reg("cleanup.plan", self._h_cleanup_plan)
+        reg("event.poll", self._h_event_poll)
+
+        self._server.register_notify("event.poll", self._h_event_poll)
+
+    # ------------------------------------------------------------------ vm.request
+
+    async def _h_vm_request(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        template = params.get("template", "ubuntu-24.04")
+        purpose = params.get("purpose", "vm")
+        headless = bool(params.get("headless", True))
+        ttl_minutes = int(params.get("ttl_minutes", self._cfg.default_ttl_minutes))
+        tags = params.get("tags") or {}
+
+        catalog_entry = self._image_manager._catalog.get(template)
+        if catalog_entry is None:
+            raise IPCError(ERR_INVALID_PARAMS, f"Unknown template: {template}")
+
+        cpu = int(params.get("cpu") or catalog_entry.get("default_cpu", 2))
+        ram_mb = int(params.get("ram_mb") or catalog_entry.get("default_ram_mb", 2048))
+        disk_gb = int(params.get("disk_gb") or catalog_entry.get("default_disk_gb", 20))
+
+        reason = await self._scheduler.check_admission(caller.project_id, cpu, ram_mb, disk_gb)
+        if reason:
+            queue_id = await self._scheduler.enqueue_request(
+                caller.project_id,
+                {**params, "caller_project_id": caller.project_id, "caller_user": caller.user},
+                reason,
+            )
+            return {
+                "status": "queued",
+                "queue_id": queue_id,
+                "reason": reason,
+                "retry_after_seconds": 60,
+                "current_capacity": self._capacity.get_status(),
+            }
+
+        vm = await self._create_vm(
+            caller_project_id=caller.project_id,
+            caller_user=caller.user,
+            template=template,
+            purpose=purpose,
+            headless=headless,
+            ttl_minutes=ttl_minutes,
+            cpu=cpu,
+            ram_mb=ram_mb,
+            disk_gb=disk_gb,
+            tags=tags,
+        )
+        return _vm_to_dict(vm)
+
+    async def _create_vm_from_request(self, request: dict[str, Any]) -> None:
+        await self._h_vm_request(request)
+
+    async def _create_vm(
+        self,
+        *,
+        caller_project_id: str,
+        caller_user: str,
+        template: str,
+        purpose: str,
+        headless: bool,
+        ttl_minutes: int,
+        cpu: int,
+        ram_mb: int,
+        disk_gb: int,
+        tags: dict[str, str],
+    ) -> VMRecord:
+        vm_id = _make_vm_id()
+        libvirt_name = _make_libvirt_name(caller_project_id, purpose, vm_id)
+        now = datetime.now(timezone.utc)
+        lease_until = now + timedelta(minutes=ttl_minutes)
+
+        await self._db.upsert_project(caller_project_id, "unknown")
+
+        base_path = await self._image_manager.ensure_image(template)
+        vm_dir = self._storage.vm_dir(caller_project_id, vm_id)
+        overlay_path = await self._storage.create_overlay(caller_project_id, vm_id, base_path, disk_gb)
+
+        ssh_pubkey = self._cfg.boxer_ssh_pubkey
+        cloud_init_iso = await self._cloud_init.build(
+            vm_id=vm_id,
+            dest_dir=vm_dir,
+            hostname=purpose[:20],
+            ssh_pubkey=ssh_pubkey,
+        )
+
+        net_name = self._network.ensure_project_network(caller_project_id)
+        serial_log = vm_dir / "serial.log"
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: self._vm_ops.define_and_start(
+                libvirt_name=libvirt_name,
+                vm_id=vm_id,
+                cpu=cpu,
+                ram_mb=ram_mb,
+                disk_path=overlay_path,
+                cloud_init_iso=cloud_init_iso,
+                net_name=net_name,
+                headless=headless,
+                serial_log=serial_log,
+            ),
+        )
+
+        vm = VMRecord(
+            id=vm_id,
+            libvirt_name=libvirt_name,
+            project_id=caller_project_id,
+            display_name=purpose,
+            state="running",
+            owner_user=caller_user,
+            template=template,
+            cpu=cpu,
+            ram_mb=ram_mb,
+            disk_gb=disk_gb,
+            headless=headless,
+            created_at=now,
+            last_touched=now,
+            lease_until=lease_until,
+            tags=tags,
+        )
+        await self._db.insert_vm(vm)
+
+        asyncio.create_task(self._poll_ip(vm_id, libvirt_name))
+
+        await self._db.add_event(
+            "INFO",
+            f"VM '{purpose}' ({vm_id}) created by {caller_user}",
+            project_id=caller_project_id,
+            vm_id=vm_id,
+        )
+        return vm
+
+    async def _poll_ip(self, vm_id: str, libvirt_name: str) -> None:
+        ip = await self._vm_ops.get_ip_via_guest_agent(libvirt_name, timeout=120)
+        if ip:
+            await self._db.update_vm_ip(vm_id, ip)
+            logger.info("VM %s got IP %s", vm_id, ip)
+
+    # ------------------------------------------------------------------ vm.list
+
+    async def _h_vm_list(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        caller = caller_from_params(params)
+        include_stale = bool(params.get("include_stale", False))
+        vms = await self._db.list_vms(None if caller.is_admin else caller.project_id)
+        result = []
+        for vm in vms:
+            if not self._policy.check_vm_list_visibility(caller, vm):
+                continue
+            d = _vm_to_dict(vm)
+            state = self._vm_ops.get_state(vm.libvirt_name)
+            d["live_state"] = state
+            d["is_stale"] = vm.lease_until < datetime.now(timezone.utc)
+            if not include_stale and d["is_stale"] and state == "stopped":
+                continue
+            result.append(d)
+        return result
+
+    # ------------------------------------------------------------------ vm.get
+
+    async def _h_vm_get(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        vm_id = params.get("vm_id")
+        if not vm_id:
+            raise IPCError(ERR_INVALID_PARAMS, "vm_id required")
+        vm = await self._db.get_vm(vm_id)
+        self._policy.check("vm.get", caller, vm)
+        await self._db.touch_vm(vm_id)
+        d = _vm_to_dict(vm)
+        d["live_state"] = self._vm_ops.get_state(vm.libvirt_name)
+        return d
+
+    # ------------------------------------------------------------------ vm.start
+
+    async def _h_vm_start(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        vm_id = params.get("vm_id")
+        if not vm_id:
+            raise IPCError(ERR_INVALID_PARAMS, "vm_id required")
+        vm = await self._db.get_vm(vm_id)
+        self._policy.check("vm.start", caller, vm)
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._vm_ops.start, vm.libvirt_name)
+        await self._db.update_vm_state(vm_id, "running")
+        return {"vm_id": vm_id, "state": "running"}
+
+    # ------------------------------------------------------------------ vm.stop
+
+    async def _h_vm_stop(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        vm_id = params.get("vm_id")
+        graceful = bool(params.get("graceful", True))
+        if not vm_id:
+            raise IPCError(ERR_INVALID_PARAMS, "vm_id required")
+        vm = await self._db.get_vm(vm_id)
+        self._policy.check("vm.stop", caller, vm)
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._vm_ops.stop, vm.libvirt_name, graceful)
+        await self._db.update_vm_state(vm_id, "stopped")
+        return {"vm_id": vm_id, "state": "stopped"}
+
+    # ------------------------------------------------------------------ vm.delete
+
+    async def _h_vm_delete(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        vm_id = params.get("vm_id")
+        if not vm_id:
+            raise IPCError(ERR_INVALID_PARAMS, "vm_id is required for delete (name alone is not accepted)")
+        vm = await self._db.get_vm(vm_id)
+        self._policy.check("vm.delete", caller, vm)
+
+        await self._db.update_vm_state(vm_id, "deleting")
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._vm_ops.undefine, vm.libvirt_name)
+        self._storage.delete_vm_storage(vm.project_id, vm_id)
+        await self._db.delete_vm(vm_id)
+
+        if not self._network.has_active_vms(vm.project_id):
+            vms_left = await self._db.list_vms(vm.project_id)
+            if not vms_left:
+                self._network.teardown_project_network(vm.project_id)
+
+        await self._db.add_event(
+            "INFO", f"VM '{vm.display_name}' ({vm_id}) deleted by {caller.user}",
+            project_id=vm.project_id, vm_id=vm_id,
+        )
+        return {"vm_id": vm_id, "deleted": True}
+
+    # ------------------------------------------------------------------ vm.extend_lease
+
+    async def _h_vm_extend_lease(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        vm_id = params.get("vm_id")
+        ttl_minutes = int(params.get("ttl_minutes", self._cfg.default_ttl_minutes))
+        if not vm_id:
+            raise IPCError(ERR_INVALID_PARAMS, "vm_id required")
+        vm = await self._db.get_vm(vm_id)
+        self._policy.check("vm.extend_lease", caller, vm)
+
+        now = datetime.now(timezone.utc)
+        new_lease = max(vm.lease_until, now) + timedelta(minutes=ttl_minutes)
+        await self._db.update_vm_lease(vm_id, new_lease)
+        return {"vm_id": vm_id, "lease_until": new_lease.isoformat()}
+
+    # ------------------------------------------------------------------ vm.snapshot
+
+    async def _h_vm_snapshot(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        vm_id = params.get("vm_id")
+        label = params.get("label", "snap")
+        if not vm_id:
+            raise IPCError(ERR_INVALID_PARAMS, "vm_id required")
+        vm = await self._db.get_vm(vm_id)
+        self._policy.check("vm.snapshot", caller, vm)
+
+        loop = asyncio.get_running_loop()
+        snap_name = await loop.run_in_executor(
+            None, self._vm_ops.snapshot, vm.libvirt_name, label
+        )
+        return {"vm_id": vm_id, "snapshot_name": snap_name}
+
+    # ------------------------------------------------------------------ vm.exec
+
+    async def _h_vm_exec(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        vm_id = params.get("vm_id")
+        command = params.get("command")
+        timeout = int(params.get("timeout_seconds", 30))
+        if not vm_id or not command:
+            raise IPCError(ERR_INVALID_PARAMS, "vm_id and command required")
+        vm = await self._db.get_vm(vm_id)
+        self._policy.check("vm.exec", caller, vm)
+        if not vm.ip_address:
+            raise IPCError(ERR_INVALID_PARAMS, "VM has no IP address yet; wait for boot to complete")
+
+        result = await self._guest.exec_ssh(vm.ip_address, command, timeout)
+        await self._db.touch_vm(vm_id)
+        return result
+
+    # ------------------------------------------------------------------ vm.screenshot
+
+    async def _h_vm_screenshot(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        vm_id = params.get("vm_id")
+        if not vm_id:
+            raise IPCError(ERR_INVALID_PARAMS, "vm_id required")
+        vm = await self._db.get_vm(vm_id)
+        self._policy.check("vm.screenshot", caller, vm)
+
+        png_b64 = await self._guest.screenshot(vm.libvirt_name)
+        await self._db.touch_vm(vm_id)
+        return {"vm_id": vm_id, "format": "png", "data": png_b64}
+
+    # ------------------------------------------------------------------ vm.input
+
+    async def _h_vm_input(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        vm_id = params.get("vm_id")
+        actions = params.get("actions", [])
+        if not vm_id:
+            raise IPCError(ERR_INVALID_PARAMS, "vm_id required")
+        vm = await self._db.get_vm(vm_id)
+        self._policy.check("vm.input", caller, vm)
+
+        await self._guest.send_input(vm.libvirt_name, actions)
+        await self._db.touch_vm(vm_id)
+        return {"vm_id": vm_id, "actions_sent": len(actions)}
+
+    # ------------------------------------------------------------------ resource.status
+
+    async def _h_resource_status(self, params: dict[str, Any]) -> dict[str, Any]:
+        return self._capacity.get_status()
+
+    # ------------------------------------------------------------------ queue.status
+
+    async def _h_queue_status(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        entries = await self._db.list_pending_queue()
+        filtered = [e for e in entries if caller.is_admin or e.project_id == caller.project_id]
+        return {
+            "pending": len(filtered),
+            "entries": [
+                {
+                    "queue_id": e.id,
+                    "project_id": e.project_id,
+                    "status": e.status,
+                    "reason": e.reason,
+                    "created_at": e.created_at.isoformat(),
+                }
+                for e in filtered
+            ],
+        }
+
+    # ------------------------------------------------------------------ cleanup.plan
+
+    async def _h_cleanup_plan(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        now = datetime.now(timezone.utc)
+        vms = await self._db.list_vms(None if caller.is_admin else caller.project_id)
+        stale = [v for v in vms if v.lease_until < now]
+        return {
+            "stale_count": len(stale),
+            "stale_vms": [
+                {
+                    "vm_id": v.id,
+                    "display_name": v.display_name,
+                    "state": v.state,
+                    "lease_expired": v.lease_until.isoformat(),
+                    "last_touched": v.last_touched.isoformat(),
+                }
+                for v in stale
+            ],
+        }
+
+    # ------------------------------------------------------------------ event.poll
+
+    async def _h_event_poll(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        since_str = params.get("since")
+        since = datetime.fromisoformat(since_str) if since_str else None
+        level = params.get("level")
+        limit = int(params.get("limit", 50))
+
+        events = await self._db.list_events(since=since, level=level, limit=limit)
+        return [
+            {
+                "event_id": e.id,
+                "project_id": e.project_id,
+                "vm_id": e.vm_id,
+                "level": e.level,
+                "message": e.message,
+                "created_at": e.created_at.isoformat(),
+            }
+            for e in events
+        ]
+
+
+def _vm_to_dict(vm: VMRecord) -> dict[str, Any]:
+    return {
+        "vm_id": vm.id,
+        "libvirt_name": vm.libvirt_name,
+        "display_name": vm.display_name,
+        "project_id": vm.project_id,
+        "state": vm.state,
+        "owner_user": vm.owner_user,
+        "template": vm.template,
+        "cpu": vm.cpu,
+        "ram_mb": vm.ram_mb,
+        "disk_gb": vm.disk_gb,
+        "headless": vm.headless,
+        "ip_address": vm.ip_address,
+        "created_at": vm.created_at.isoformat(),
+        "last_touched": vm.last_touched.isoformat(),
+        "lease_until": vm.lease_until.isoformat(),
+        "tags": vm.tags,
+    }

@@ -1,0 +1,30 @@
+# Boxer configuration
+# Copy to /etc/boxer/boxer.yaml for system-wide use
+
+state_dir: /var/lib/boxer
+socket_path: /run/boxer/boxer.sock
+notify_socket_path: /run/boxer/boxer-notify.sock
+libvirt_uri: qemu:///system
+
+# Resource caps
+host_reserved_ram_gib: 4
+# max_total_vcpus: null  # null = host_threads - 2
+max_concurrent_installs: 1
+max_running_per_project: 2
+max_disk_per_project_gib: 80
+
+# Lease defaults
+default_ttl_minutes: 60
+stale_warn_grace_minutes: 15
+stale_delete_grace_hours: 24
+
+# SSH access into VMs
+# boxer_ssh_pubkey: "ssh-ed25519 AAAA..."
+# boxer_ssh_privkey_path: /etc/boxer/boxer_id_ed25519
+
+# Networking
+network_base_cidr: "10.200.0.0/16"
+network_prefix_len: 24
+
+# Admin group (can bypass project_id ownership checks via CLI)
+admin_group: boxer-admin

@@ -1,0 +1,51 @@
+# Boxer image catalog
+# Only URLs listed here may be fetched by boxerd.
+# All entries require a sha256 checksum; the daemon verifies before use.
+# type: cloud-image uses cloud-init for first boot
+# type: iso is a traditional installer ISO (slower, queued as heavyweight job)
+
+images:
+  ubuntu-24.04:
+    type: cloud-image
+    description: "Ubuntu 24.04 LTS (Noble Numbat)"
+    url: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+    sha256: null  # set to actual sha256 after first verified download; null = fetch and verify manifest
+    default_cpu: 2
+    default_ram_mb: 2048
+    default_disk_gb: 20
+
+  ubuntu-22.04:
+    type: cloud-image
+    description: "Ubuntu 22.04 LTS (Jammy Jellyfish)"
+    url: "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
+    sha256: null
+    default_cpu: 2
+    default_ram_mb: 2048
+    default_disk_gb: 20
+
+  debian-12:
+    type: cloud-image
+    description: "Debian 12 (Bookworm)"
+    url: "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"
+    sha256: null
+    default_cpu: 2
+    default_ram_mb: 2048
+    default_disk_gb: 20
+
+  fedora-40:
+    type: cloud-image
+    description: "Fedora 40 Cloud Base"
+    url: "https://download.fedoraproject.org/pub/fedora/linux/releases/40/Cloud/x86_64/images/Fedora-Cloud-Base-Generic.x86_64-40-1.14.qcow2"
+    sha256: null
+    default_cpu: 2
+    default_ram_mb: 2048
+    default_disk_gb: 20
+
+  arch-latest:
+    type: iso
+    description: "Arch Linux (latest ISO)"
+    url: "https://geo.mirror.pkgbuild.com/iso/latest/archlinux-x86_64.iso"
+    sha256: null
+    default_cpu: 2
+    default_ram_mb: 2048
+    default_disk_gb: 30
