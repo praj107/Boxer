@@ -11,7 +11,7 @@ from typing import Any, Optional
 import libvirt
 
 from boxer.config import BoxerConfig, get_config
-from boxer.ipc import ERR_INVALID_PARAMS, ERR_NOT_FOUND, IPCError
+from boxer.ipc import ERR_INVALID_PARAMS, ERR_NOT_FOUND, ERR_POLICY_VIOLATION, IPCError
 from boxer.types import VMRecord
 from boxerd.cloud_init import CloudInitBuilder
 from boxerd.db import Database
@@ -185,6 +185,7 @@ class BoxerDaemon:
         reg("vm.exec", self._h_vm_exec)
         reg("vm.screenshot", self._h_vm_screenshot)
         reg("vm.input", self._h_vm_input)
+        reg("image.preflight", self._h_image_preflight)
         reg("resource.status", self._h_resource_status)
         reg("queue.status", self._h_queue_status)
         reg("cleanup.plan", self._h_cleanup_plan)
@@ -664,6 +665,18 @@ class BoxerDaemon:
         await self._guest.send_input(vm.libvirt_name, actions)
         await self._db.touch_vm(vm_id)
         return {"vm_id": vm_id, "actions_sent": len(actions)}
+
+    # ------------------------------------------------------------------ image.preflight
+
+    async def _h_image_preflight(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        if not caller.is_admin:
+            raise IPCError(ERR_POLICY_VIOLATION, "image.preflight requires admin privileges")
+        templates = params.get("templates")
+        if templates is not None and not isinstance(templates, list):
+            raise IPCError(ERR_INVALID_PARAMS, "templates must be a list of template names")
+        reports = await self._image_manager.preflight(templates)
+        return {"reports": reports}
 
     # ------------------------------------------------------------------ resource.status
 

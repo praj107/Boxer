@@ -331,6 +331,43 @@ def reconcile(fix: bool, as_json: bool) -> None:
         click.echo(f"\n{len(foreign)} foreign domain(s) still require manual 'boxer import <name>'.")
 
 
+@cli.command("image-trust")
+@click.argument("templates", nargs=-1)
+@click.option("--json", "as_json", is_flag=True, help="Output JSON")
+def image_trust(templates: tuple[str, ...], as_json: bool) -> None:
+    """Preflight the trust chain (checksum manifest + PGP signature) of catalog images.
+
+    Downloads only the small checksum manifests and signatures — never the
+    multi-gigabyte artifacts. With no arguments, checks every catalog entry.
+    """
+    params: dict[str, Any] = {}
+    if templates:
+        params["templates"] = list(templates)
+    result = _run(_call("image.preflight", params))
+    reports = result.get("reports", [])
+
+    if as_json:
+        click.echo(json.dumps(reports, indent=2))
+        return
+
+    if not reports:
+        click.echo("No catalog entries to check.")
+        return
+
+    symbols = {
+        "signed": "✓ signed",
+        "checksum-only": "~ checksum",
+        "unverified": "! unverified",
+        "error": "✗ error",
+    }
+    click.echo(f"{'TEMPLATE':<16} {'STATUS':<14} {'REQ':<4} DETAIL")
+    click.echo("-" * 80)
+    for r in reports:
+        status = symbols.get(r.get("status", ""), r.get("status", "?"))
+        req = "yes" if r.get("signature_required") else "-"
+        click.echo(f"{r['template']:<16} {status:<14} {req:<4} {r.get('detail', '')}")
+
+
 @cli.command("import")
 @click.argument("domain")
 @click.option("--project", "project_id", default="p_imported", show_default=True,

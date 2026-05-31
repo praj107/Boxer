@@ -204,7 +204,7 @@ fi
 
 _check_deps() {
     local tool missing=()
-    local tools=(virsh ssh-keygen systemctl apt-get python3 flock getent groupadd usermod sed mktemp install)
+    local tools=(virsh ssh-keygen systemctl apt-get python3 flock getent groupadd usermod sed mktemp install gpgv)
     for tool in "${tools[@]}"; do
         command -v "${tool}" &>/dev/null || missing+=("${tool}")
     done
@@ -279,6 +279,8 @@ PKGS=(
     pkg-config
     # cloud-init ISO generation
     genisoimage
+    # PGP signature verification of image checksum manifests (gpgv)
+    gnupg
     # desktop notifications (boxer-notifier)
     libnotify-bin
     # screenshot conversion (optional, PIL is fallback)
@@ -347,6 +349,7 @@ fi
 
 info "Creating directories…"
 run_cmd install -d -m 0755 "${CONFIG_DIR}"
+run_cmd install -d -m 0755 "${CONFIG_DIR}/keyrings"
 run_cmd install -d -m 0750 -o root -g libvirt "${STATE_DIR}"
 run_cmd install -d -m 0750 -o root -g libvirt "${INSTALL_DIR}"
 ok "Directories created."
@@ -378,6 +381,26 @@ else
     echo "[DRY-RUN] install config: images.yaml → ${CONFIG_DIR}/images.yaml"
 fi
 _record_step "config-files"
+
+# ── 5b. trusted PGP keyrings ────────────────────────────────────────────────────
+
+info "Installing trusted image keyrings to ${CONFIG_DIR}/keyrings…"
+if [[ "${DRY_RUN}" -eq 0 ]]; then
+    _kr_found=0
+    shopt -s nullglob
+    for _kr in "${REPO_DIR}"/config/keyrings/*.gpg "${REPO_DIR}"/config/keyrings/*.kbx; do
+        _kr_found=1
+        _install_config "${_kr}" "${CONFIG_DIR}/keyrings/$(basename "${_kr}")" 0644
+    done
+    shopt -u nullglob
+    if [[ "${_kr_found}" -eq 0 ]]; then
+        warn "No keyrings bundled — image signatures will verify by checksum only."
+        warn "See ${CONFIG_DIR}/keyrings (config/keyrings/README.md) to enable fail-closed PGP verification."
+    fi
+else
+    echo "[DRY-RUN] install trusted keyrings → ${CONFIG_DIR}/keyrings/"
+fi
+_record_step "keyrings"
 
 # ── 6. SSH keypair for VM access ───────────────────────────────────────────────
 

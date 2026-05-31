@@ -6,6 +6,11 @@ socket_path: /run/boxer/boxer.sock
 notify_socket_path: /run/boxer/boxer-notify.sock
 libvirt_uri: qemu:///system
 
+# Pinned PGP keyrings used to verify image checksum manifests (see images.yaml
+# verification.signature.keyring). Bare keyring names in the catalog resolve
+# relative to this directory; absolute paths are used as-is.
+keyrings_dir: /etc/boxer/keyrings
+
 # Resource caps
 host_reserved_ram_gib: 4
 # max_total_vcpus: null  # null = host_threads - 2

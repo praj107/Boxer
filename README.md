@@ -9,10 +9,11 @@ A policy-enforcing QEMU/KVM control plane that lets AI coding assistants (and hu
 - **Admission control & queueing** — configurable caps on RAM, vCPUs, running VMs per project, and disk per project; over-capacity requests queue automatically and are promoted when resources free.
 - **Per-project NAT networks** — each project gets its own isolated libvirt network (`boxer-net-<id>`); VMs are not visible to each other across projects.
 - **Lease management** — every VM has a TTL; expired running VMs emit warnings, expired stopped VMs are auto-deleted after a grace period.
-- **Allowlisted image catalog** — only HTTPS URLs in `images.yaml` can be fetched; all downloads are SHA-256 verified; private/RFC-1918 IPs are blocked.
+- **Allowlisted image catalog** — only HTTPS URLs in `images.yaml` can be fetched; all downloads are checksum-verified against a manifest or static pin; private/RFC-1918 IPs are blocked.
+- **PGP-verified checksums** — catalog entries can require a `gpgv`-checked signature (detached or clearsigned) on the checksum manifest, validated against a pinned local keyring; fails closed when `signature_required: true`. Preflight every trust chain with `boxer image-trust`.
 - **cloud-init provisioning** — headless VMs boot with SSH ready, QEMU guest agent running, and Boxer's key injected.
 - **Headed VMs** — SPICE display bound to `127.0.0.1`; screenshot and keyboard input tools available.
-- **Human CLI** — `boxer ls / start / stop / delete / cleanup / prune / events / status`
+- **Human CLI** — `boxer ls / start / stop / delete / cleanup / prune / events / status / image-trust`
 - **Desktop notifications** — `boxer-notifier` (user systemd service) calls `notify-send` when stale VMs need attention.
 
 ## Setup

@@ -3,6 +3,17 @@
 # Prefer checksum-manifest verification; static sha256 pins remain supported.
 # type: cloud-image uses cloud-init for first boot
 # type: iso is a traditional installer ISO (slower, queued as heavyweight job)
+#
+# PGP signature verification (Milestone 2):
+#   verification.signature.mode        detached | clearsigned
+#   verification.signature.signature_url  detached signature of the manifest (omit for clearsigned)
+#   verification.signature.keyring     keyring filename under keyrings_dir (or an absolute path)
+#   verification.signature.fingerprints optional list of pinned signing-key fingerprints
+#   verification.signature.required    fail closed when the signature cannot be confirmed
+#
+# Signatures default to required: false so a fresh install verifies by checksum
+# manifest out of the box. After installing the trusted keyrings into
+# /etc/boxer/keyrings (see keyrings/README.md), flip required: true to fail closed.
 
 images:
   ubuntu-24.04:
@@ -15,7 +26,11 @@ images:
       checksum_url: "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS"
       checksum_algorithm: sha256
       checksum_filename: "noble-server-cloudimg-amd64.img"
-      signature_url: "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS.gpg" # PGP enforcement planned
+      signature:
+        mode: detached
+        signature_url: "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS.gpg"
+        keyring: "ubuntu-cloudimage-keyring.gpg"
+        required: false
     default_cpu: 2
     default_ram_mb: 2048
     default_disk_gb: 20
@@ -30,7 +45,11 @@ images:
       checksum_url: "https://cloud-images.ubuntu.com/jammy/current/SHA256SUMS"
       checksum_algorithm: sha256
       checksum_filename: "jammy-server-cloudimg-amd64.img"
-      signature_url: "https://cloud-images.ubuntu.com/jammy/current/SHA256SUMS.gpg" # PGP enforcement planned
+      signature:
+        mode: detached
+        signature_url: "https://cloud-images.ubuntu.com/jammy/current/SHA256SUMS.gpg"
+        keyring: "ubuntu-cloudimage-keyring.gpg"
+        required: false
     default_cpu: 2
     default_ram_mb: 2048
     default_disk_gb: 20
@@ -45,6 +64,11 @@ images:
       checksum_url: "https://cdimage.debian.org/cdimage/cloud/bookworm/latest/SHA512SUMS"
       checksum_algorithm: sha512
       checksum_filename: "debian-12-genericcloud-amd64.qcow2"
+      signature:
+        mode: detached
+        signature_url: "https://cdimage.debian.org/cdimage/cloud/bookworm/latest/SHA512SUMS.sign"
+        keyring: "debian-cloud-keyring.gpg"
+        required: false
     default_cpu: 2
     default_ram_mb: 2048
     default_disk_gb: 20
@@ -59,6 +83,13 @@ images:
       checksum_url: "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-44-1.7-x86_64-CHECKSUM"
       checksum_algorithm: sha256
       checksum_filename: "Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2"
+      signature:
+        # Fedora ships the *-CHECKSUM file as an inline PGP clearsigned message,
+        # so there is no separate signature_url; checksums are read from the
+        # signed payload after verification.
+        mode: clearsigned
+        keyring: "fedora-44-keyring.gpg"
+        required: false
     default_cpu: 2
     default_ram_mb: 2048
     default_disk_gb: 20
@@ -68,6 +99,9 @@ images:
     description: "Arch Linux (latest ISO)"
     url: "https://geo.mirror.pkgbuild.com/iso/latest/archlinux-x86_64.iso"
     sha256: null
+    # Arch signs the ISO itself (archlinux-x86_64.iso.sig) rather than a checksum
+    # manifest. ISO installer fetching is deferred to Milestone 3; signature
+    # enforcement for the ISO is wired up alongside that workflow.
     default_cpu: 2
     default_ram_mb: 2048
     default_disk_gb: 30

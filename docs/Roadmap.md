@@ -49,15 +49,38 @@ Reference sources used for the catalog direction:
 
 ## Milestone 2: PGP Keyring Verification
 
+Status: implemented in this branch.
+
 Add distro-aware signature verification for checksum manifests.
 
-Planned work:
+Scope:
 
-- Add catalog fields for `signature_url`, `keyring_path`, expected fingerprint, and signature requirement.
-- Verify Ubuntu `SHA256SUMS.gpg`, Debian `SHA512SUMS.sign`, Fedora `*-CHECKSUM`, AlmaLinux `CHECKSUM.asc`, and Arch ISO signatures with pinned local keyrings.
-- Fail closed when `signature_required: true` and verification is unavailable or invalid.
-- Store verification provenance in image cache metadata.
-- Add an admin command to preflight all configured image trust chains.
+- Catalog `verification.signature` block (with flat fallbacks) for `signature_url`,
+  `keyring_path`, `signature_fingerprints`, `signature_mode`, and `signature_required`.
+- Two signature shapes: `detached` (Ubuntu `SHA256SUMS.gpg`, Debian `SHA512SUMS.sign`)
+  and `clearsigned` (Fedora/AlmaLinux `*-CHECKSUM`), with checksums read from the
+  signed payload for clearsigned manifests.
+- Verification uses `gpgv` against a pinned keyring under `keyrings_dir`
+  (default `/etc/boxer/keyrings`); `gpgv` never touches the user trust DB or
+  imports keys, so the keyring is the sole trust anchor.
+- Optional signing-key fingerprint pinning enforced when configured.
+- Fail closed when `signature_required: true` and the signature is missing,
+  the keyring is absent, or verification fails; otherwise fall back to
+  checksum-manifest verification with a warning.
+- Verification provenance (`signature_verified`, `signature_provenance`) stored
+  in image cache metadata.
+- `boxer image-trust [templates…]` admin command (IPC `image.preflight`) checks
+  every configured trust chain by fetching only manifests and signatures, never
+  the multi-gigabyte artifacts.
+
+Notes / deferred within this milestone:
+
+- Distro public keyrings are not bundled; admins install them into
+  `keyrings_dir` (see `config/keyrings/README.md`). Catalog entries ship with
+  `signature_required: false` so a fresh install verifies by checksum manifest,
+  and flip to fail-closed once the keyring is provisioned.
+- Arch signs the ISO itself rather than a checksum manifest; its signature
+  enforcement is wired up with the ISO installer workflow in Milestone 3.
 
 ## Milestone 3: ISO Installer Workflow
 

@@ -50,6 +50,11 @@ class BoxerConfig:
         return self.state_dir / "isos"
 
     @property
+    def keyrings_dir(self) -> Path:
+        """Directory of pinned PGP keyrings used to verify checksum manifests."""
+        return Path(self._d.get("keyrings_dir", "/etc/boxer/keyrings"))
+
+    @property
     def projects_dir(self) -> Path:
         return self.state_dir / "projects"
 
