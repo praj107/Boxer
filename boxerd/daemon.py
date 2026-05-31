@@ -13,7 +13,7 @@ import libvirt
 from boxer.config import BoxerConfig, get_config
 from boxer.ipc import ERR_INVALID_PARAMS, ERR_NOT_FOUND, ERR_POLICY_VIOLATION, IPCError
 from boxer.types import VMRecord
-from boxerd.cloud_init import CloudInitBuilder
+from boxerd.cloud_init import CloudInitBuilder, WriteFile
 from boxerd.db import Database
 from boxerd.guest_agent import GuestAgent
 from boxerd.image_catalog import ImageManager
@@ -22,6 +22,7 @@ from boxerd.ipc_server import IPCServer
 from boxerd.lease_manager import LeaseManager
 from boxerd.network_ops import NetworkManager
 from boxerd.policy import PolicyEngine, caller_from_params
+from boxerd.profiles import MAX_PROFILES, available_profiles, resolve_profiles
 from boxerd.reconcile import build_reconcile_report, parse_boxer_name, _extract_disk_path, _get_disk_size_gb
 from boxerd.scheduler import HostCapacity, Scheduler
 from boxerd.ssh_keys import SSHKeyManager, SSHKeyMaterial
@@ -107,11 +108,124 @@ def _bootstrap_from_params(params: dict[str, Any]) -> dict[str, list[str]]:
     if invalid_keys:
         raise IPCError(ERR_INVALID_PARAMS, "ssh_public_keys entries must be OpenSSH public keys")
 
+    # Named profiles expand into extra packages + setup commands (bounded allowlist).
+    profile_names = _string_list(
+        params.get("profiles", bootstrap.get("profiles")), "profiles", max_items=MAX_PROFILES, max_len=32
+    )
+    resolved = resolve_profiles(profile_names)
+    packages = _dedupe_keep_order([*resolved["packages"], *packages])
+    commands = _dedupe_keep_order([*resolved["runcmd"], *commands])
+    if len(packages) > 80:
+        raise IPCError(ERR_INVALID_PARAMS, "Too many packages after profile expansion (max 80)")
+
+    write_files, secret_count = _parse_file_injections(params, bootstrap)
+    if secret_count:
+        # Best-effort: drop cloud-init's persisted copy of user-data after first
+        # boot so injected secret material is not readable from the instance cache.
+        commands.append(
+            "find /var/lib/cloud/instances -maxdepth 2 -name user-data.txt -delete 2>/dev/null || true"
+        )
+
     return {
         "packages": packages,
         "commands": commands,
         "ssh_public_keys": ssh_public_keys,
+        "write_files": write_files,
+        "secret_count": secret_count,
+        "profiles": profile_names,
     }
+
+
+def _dedupe_keep_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+_WAIT_CONDITIONS = {"guest_agent", "ip", "ssh", "cloud_init", "package_install"}
+
+
+def _parse_wait_conditions(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise IPCError(ERR_INVALID_PARAMS, "wait_for must be a list of condition names")
+    conditions: list[str] = []
+    for item in value:
+        if item not in _WAIT_CONDITIONS:
+            raise IPCError(
+                ERR_INVALID_PARAMS,
+                f"Unknown wait condition '{item}'. Valid: {sorted(_WAIT_CONDITIONS)}",
+            )
+        if item not in conditions:
+            conditions.append(item)
+    return conditions
+
+
+_PERMISSIONS_RE = re.compile(r"^0[0-7]{3}$")
+_MAX_FILE_BYTES = 256 * 1024
+_MAX_TOTAL_FILE_BYTES = 1024 * 1024
+
+
+def _parse_file_injections(
+    params: dict[str, Any], bootstrap: dict[str, Any]
+) -> tuple[list[WriteFile], int]:
+    """Parse write_files (regular) and secret_files (mode 0600, never logged)."""
+    regular = _coerce_file_list(
+        params.get("write_files", bootstrap.get("write_files")),
+        "write_files",
+        default_permissions="0644",
+        default_owner="root:root",
+    )
+    secrets = _coerce_file_list(
+        params.get("secret_files", bootstrap.get("secret_files")),
+        "secret_files",
+        default_permissions="0600",
+        default_owner="boxer:boxer",
+    )
+    files = [*regular, *secrets]
+    if len(files) > 20:
+        raise IPCError(ERR_INVALID_PARAMS, "At most 20 injected files are allowed")
+    total = sum(len(f.content.encode("utf-8")) for f in files)
+    if total > _MAX_TOTAL_FILE_BYTES:
+        raise IPCError(ERR_INVALID_PARAMS, "Injected files exceed the 1 MiB total limit")
+    paths = [f.path for f in files]
+    if len(set(paths)) != len(paths):
+        raise IPCError(ERR_INVALID_PARAMS, "Duplicate injected file paths")
+    return files, len(secrets)
+
+
+def _coerce_file_list(
+    value: Any, field: str, *, default_permissions: str, default_owner: str
+) -> list[WriteFile]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise IPCError(ERR_INVALID_PARAMS, f"{field} must be a list of objects")
+    result: list[WriteFile] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise IPCError(ERR_INVALID_PARAMS, f"{field} entries must be objects with path and content")
+        path = item.get("path")
+        content = item.get("content")
+        if not isinstance(path, str) or not path.startswith("/") or len(path) > 256:
+            raise IPCError(ERR_INVALID_PARAMS, f"{field}: path must be an absolute path <= 256 chars")
+        if not isinstance(content, str):
+            raise IPCError(ERR_INVALID_PARAMS, f"{field}: content must be a string")
+        if len(content.encode("utf-8")) > _MAX_FILE_BYTES:
+            raise IPCError(ERR_INVALID_PARAMS, f"{field}: '{path}' exceeds the 256 KiB per-file limit")
+        permissions = item.get("permissions", default_permissions)
+        if not isinstance(permissions, str) or not _PERMISSIONS_RE.match(permissions):
+            raise IPCError(ERR_INVALID_PARAMS, f"{field}: permissions must be an octal mode like 0644")
+        owner = item.get("owner", default_owner)
+        if not isinstance(owner, str) or len(owner) > 64:
+            raise IPCError(ERR_INVALID_PARAMS, f"{field}: owner must be a string like 'user:group'")
+        result.append(WriteFile(path=path, content=content, permissions=permissions, owner=owner))
+    return result
 
 
 class BoxerDaemon:
@@ -189,6 +303,11 @@ class BoxerDaemon:
         reg("vm.screenshot", self._h_vm_screenshot)
         reg("vm.input", self._h_vm_input)
         reg("image.preflight", self._h_image_preflight)
+        reg("profile.list", self._h_profile_list)
+        reg("image.list", self._h_image_list)
+        reg("image.prewarm", self._h_image_prewarm)
+        reg("image.refresh", self._h_image_refresh)
+        reg("image.prune", self._h_image_prune)
         reg("resource.status", self._h_resource_status)
         reg("queue.status", self._h_queue_status)
         reg("cleanup.plan", self._h_cleanup_plan)
@@ -213,6 +332,14 @@ class BoxerDaemon:
         ssh_access = bool(params.get("ssh_access", False) or params.get("return_ssh_private_key", False))
         return_ssh_private_key = bool(params.get("return_ssh_private_key", False))
         wait_for_ip_seconds = int(params.get("wait_for_ip_seconds", 0) or 0)
+        wait_for = _parse_wait_conditions(params.get("wait_for"))
+        wait_command = params.get("wait_command")
+        if wait_command is not None and not isinstance(wait_command, str):
+            raise IPCError(ERR_INVALID_PARAMS, "wait_command must be a string")
+        wait_timeout_seconds = max(0, min(int(params.get("wait_timeout_seconds", 0) or 0), 900))
+        # Asking for a wait condition implies we must first obtain an IP.
+        if (wait_for or wait_command) and wait_for_ip_seconds == 0:
+            wait_for_ip_seconds = wait_timeout_seconds or 120
 
         catalog_entry = self._image_manager._catalog.get(template)
         if catalog_entry is None:
@@ -257,7 +384,61 @@ class BoxerDaemon:
         result = _vm_to_dict(vm)
         if ssh_access_info:
             result["ssh_access"] = ssh_access_info
+        if wait_for or wait_command:
+            result["wait_results"] = await self._wait_for_conditions(
+                vm, wait_for, wait_command, wait_timeout_seconds or 300
+            )
         return result
+
+    async def _wait_for_conditions(
+        self,
+        vm: VMRecord,
+        conditions: list[str],
+        command: Optional[str],
+        timeout_seconds: int,
+    ) -> dict[str, str]:
+        """Poll for optional readiness conditions, bounded by timeout_seconds.
+
+        Returns a per-condition status: ready | timeout | error | skipped.
+        Conditions needing in-guest access are skipped when no IP is available.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        report: dict[str, str] = {}
+
+        def remaining() -> float:
+            return max(1.0, deadline - loop.time())
+
+        ip = vm.ip_address
+
+        async def _poll_ssh(cmd: str) -> str:
+            while loop.time() < deadline:
+                try:
+                    res = await self._guest.exec_ssh(ip, cmd, timeout_seconds=min(30, int(remaining())))
+                    if res.get("exit_code", 1) == 0:
+                        return "ready"
+                except Exception:
+                    pass
+                await asyncio.sleep(5)
+            return "timeout"
+
+        for cond in conditions:
+            if cond in ("guest_agent", "ip"):
+                report[cond] = "ready" if ip else "timeout"
+            elif cond == "ssh":
+                report[cond] = "skipped" if not ip else await _poll_ssh("true")
+            elif cond in ("cloud_init", "package_install"):
+                report[cond] = (
+                    "skipped"
+                    if not ip
+                    else await _poll_ssh("cloud-init status --wait >/dev/null 2>&1 || cloud-init status | grep -q done")
+                )
+            else:
+                report[cond] = "error"
+
+        if command:
+            report["command"] = "skipped" if not ip else await _poll_ssh(command)
+        return report
 
     async def _create_vm_from_request(self, request: dict[str, Any]) -> None:
         request = {**request, "return_ssh_private_key": False}
@@ -505,7 +686,7 @@ class BoxerDaemon:
         libvirt_name = _make_libvirt_name(caller_project_id, purpose, vm_id)
         now = datetime.now(timezone.utc)
         lease_until = now + timedelta(minutes=ttl_minutes)
-        bootstrap = bootstrap or {"packages": [], "commands": [], "ssh_public_keys": []}
+        bootstrap = bootstrap or {"packages": [], "commands": [], "ssh_public_keys": [], "write_files": []}
 
         await self._db.upsert_project(caller_project_id, "unknown")
 
@@ -528,6 +709,7 @@ class BoxerDaemon:
             ssh_authorized_keys=ssh_keys,
             packages=bootstrap["packages"],
             runcmd=bootstrap["commands"],
+            write_files=bootstrap.get("write_files") or [],
         )
 
         net_name = self._network.ensure_project_network(caller_project_id)
@@ -900,6 +1082,62 @@ class BoxerDaemon:
             raise IPCError(ERR_INVALID_PARAMS, "templates must be a list of template names")
         reports = await self._image_manager.preflight(templates)
         return {"reports": reports}
+
+    # ------------------------------------------------------------------ profile.list
+
+    async def _h_profile_list(self, params: dict[str, Any]) -> dict[str, Any]:
+        return {"profiles": available_profiles()}
+
+    # ------------------------------------------------------------------ image.list
+
+    async def _h_image_list(self, params: dict[str, Any]) -> dict[str, Any]:
+        return {"images": self._image_manager.list_images()}
+
+    # ------------------------------------------------------------------ image.prewarm
+
+    async def _h_image_prewarm(self, params: dict[str, Any]) -> dict[str, Any]:
+        template = params.get("template")
+        if not template:
+            raise IPCError(ERR_INVALID_PARAMS, "template required")
+        entry = self._image_manager._catalog.get(template)
+        if entry is None:
+            raise IPCError(ERR_INVALID_PARAMS, f"Unknown template: {template}")
+        is_iso = str(entry.get("type") or entry.get("artifact_type")) == "iso"
+        if is_iso:
+            path = await self._image_manager.ensure_iso(template)
+        else:
+            path = await self._image_manager.ensure_image(template)
+        meta = self._image_manager._read_metadata(template, iso=is_iso) or {}
+        current = meta.get("current") or {}
+        return {
+            "template": template,
+            "artifact_type": "iso" if is_iso else "cloud-image",
+            "cached": True,
+            "path": str(path),
+            "current_digest": f"{current.get('algorithm')}:{current.get('digest')}",
+            "signature_verified": bool(current.get("signature_verified")),
+        }
+
+    # ------------------------------------------------------------------ image.refresh
+
+    async def _h_image_refresh(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        if not caller.is_admin:
+            raise IPCError(ERR_POLICY_VIOLATION, "image.refresh requires admin privileges")
+        template = params.get("template")
+        if not template:
+            raise IPCError(ERR_INVALID_PARAMS, "template required")
+        return await self._image_manager.refresh_image(template)
+
+    # ------------------------------------------------------------------ image.prune
+
+    async def _h_image_prune(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        if not caller.is_admin:
+            raise IPCError(ERR_POLICY_VIOLATION, "image.prune requires admin privileges")
+        older_than_seconds = int(params.get("older_than_seconds", 0) or 0)
+        dry_run = bool(params.get("dry_run", False))
+        return await self._image_manager.prune(older_than_seconds, dry_run)
 
     # ------------------------------------------------------------------ resource.status
 

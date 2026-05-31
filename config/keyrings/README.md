@@ -20,6 +20,7 @@ On install, `scripts/setup.sh` creates `/etc/boxer/keyrings` and copies any
 | `ubuntu-cloudimage-keyring.gpg` | Ubuntu Cloud Image signing key (signs `SHA256SUMS.gpg`)  |
 | `debian-cloud-keyring.gpg`      | Debian Cloud Images signing key (signs `SHA512SUMS.sign`)|
 | `fedora-44-keyring.gpg`         | Fedora 44 release key (clearsigns `*-CHECKSUM`)          |
+| `almalinux-9-keyring.gpg`       | AlmaLinux 9 release key (clearsigns `CHECKSUM`)          |
 
 These public keys are **not bundled** with Boxer: they should be obtained and
 cross-checked through each distro's own out-of-band channel, then exported into

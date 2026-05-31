@@ -192,9 +192,10 @@ async def test_ensure_iso_rejects_cloud_image_template(tmp_path) -> None:
 def test_iso_and_image_caches_are_separate(tmp_path) -> None:
     cfg = BoxerConfig({"state_dir": str(tmp_path)})
     mgr = ImageManager(cfg, ImageCatalog({"images": {}}))
-    image_path = mgr._base_path("ubuntu", iso=False)
-    iso_path = mgr._base_path("arch", iso=True)
+    image_path = mgr._blob_path("ubuntu", "sha256", "abc", iso=False)
+    iso_path = mgr._blob_path("arch", "sha256", "abc", iso=True)
     assert cfg.images_dir in image_path.parents
     assert cfg.isos_dir in iso_path.parents
-    assert image_path.name == "base.qcow2"
-    assert iso_path.name == "installer.iso"
+    # Content-addressed: digest in the filename, distinct extensions per kind.
+    assert image_path.name == "sha256-abc.qcow2"
+    assert iso_path.name == "sha256-abc.iso"

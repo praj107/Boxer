@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import subprocess
 import tempfile
@@ -20,10 +21,20 @@ local-hostname: {hostname}
 
 
 @dataclass(frozen=True)
+class WriteFile:
+    """A file to inject via cloud-init write_files. Content is base64-encoded."""
+    path: str
+    content: str  # raw text; base64-encoded at render time
+    permissions: str = "0644"
+    owner: str = "root:root"
+
+
+@dataclass(frozen=True)
 class CloudInitOptions:
     ssh_authorized_keys: list[str] = field(default_factory=list)
     packages: list[str] = field(default_factory=list)
     runcmd: list[str] = field(default_factory=list)
+    write_files: list[WriteFile] = field(default_factory=list)
 
 
 def _dedupe(items: list[str]) -> list[str]:
@@ -55,7 +66,7 @@ def _render_user_data(hostname: str, options: CloudInitOptions) -> str:
     if options.ssh_authorized_keys:
         user["ssh_authorized_keys"] = options.ssh_authorized_keys
 
-    data = {
+    data: dict[str, object] = {
         "hostname": hostname,
         "manage_etc_hosts": True,
         "users": [user],
@@ -63,6 +74,17 @@ def _render_user_data(hostname: str, options: CloudInitOptions) -> str:
         "packages": packages,
         "runcmd": runcmd,
     }
+    if options.write_files:
+        data["write_files"] = [
+            {
+                "path": wf.path,
+                "encoding": "b64",
+                "content": base64.b64encode(wf.content.encode("utf-8")).decode("ascii"),
+                "permissions": wf.permissions,
+                "owner": wf.owner,
+            }
+            for wf in options.write_files
+        ]
     return "#cloud-config\n" + yaml.safe_dump(data, sort_keys=False)
 
 
@@ -76,6 +98,7 @@ class CloudInitBuilder:
         ssh_authorized_keys: Optional[list[str]] = None,
         packages: Optional[list[str]] = None,
         runcmd: Optional[list[str]] = None,
+        write_files: Optional[list[WriteFile]] = None,
     ) -> Path:
         iso_path = dest_dir / "cloud-init.iso"
         if iso_path.exists():
@@ -91,6 +114,7 @@ class CloudInitBuilder:
                 ssh_authorized_keys=_dedupe(keys),
                 packages=packages or [],
                 runcmd=runcmd or [],
+                write_files=write_files or [],
             ),
         )
         meta_data = _META_DATA_TEMPLATE.format(vm_id=vm_id, hostname=hostname)

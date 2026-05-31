@@ -44,6 +44,58 @@ async def test_box_request_vm_passes_params() -> None:
 
 
 @pytest.mark.asyncio
+async def test_box_request_vm_passes_profiles_and_wait() -> None:
+    with patch("boxer_mcp.tools.ipc", new_callable=AsyncMock) as mock_ipc:
+        mock_ipc.return_value = {"vm_id": "vm_abc"}
+        from boxer_mcp.tools import box_request_vm
+        await box_request_vm(
+            template="ubuntu-24.04",
+            purpose="dev",
+            profiles=["python", "docker"],
+            write_files=[{"path": "/etc/app.conf", "content": "k=v"}],
+            secret_files=[{"path": "/run/token", "content": "s3cr3t"}],
+            wait_for=["ssh", "cloud_init"],
+            wait_timeout_seconds=300,
+        )
+        params = mock_ipc.call_args[0][1]
+        assert params["profiles"] == ["python", "docker"]
+        assert params["write_files"][0]["path"] == "/etc/app.conf"
+        assert params["secret_files"][0]["content"] == "s3cr3t"
+        assert params["wait_for"] == ["ssh", "cloud_init"]
+        assert params["wait_timeout_seconds"] == 300
+
+
+@pytest.mark.asyncio
+async def test_box_list_profiles_unwraps_result() -> None:
+    with patch("boxer_mcp.tools.ipc", new_callable=AsyncMock) as mock_ipc:
+        mock_ipc.return_value = {"profiles": [{"name": "python", "description": "Py", "packages": ["python3"]}]}
+        from boxer_mcp.tools import box_list_profiles
+        rows = await box_list_profiles()
+        mock_ipc.assert_called_once_with("profile.list", {})
+        assert rows[0]["name"] == "python"
+
+
+@pytest.mark.asyncio
+async def test_box_list_images_unwraps_result() -> None:
+    with patch("boxer_mcp.tools.ipc", new_callable=AsyncMock) as mock_ipc:
+        mock_ipc.return_value = {"images": [{"template": "ubuntu-24.04", "family": "ubuntu"}]}
+        from boxer_mcp.tools import box_list_images
+        rows = await box_list_images()
+        mock_ipc.assert_called_once_with("image.list", {})
+        assert rows[0]["family"] == "ubuntu"
+
+
+@pytest.mark.asyncio
+async def test_box_prewarm_image_passes_template() -> None:
+    with patch("boxer_mcp.tools.ipc", new_callable=AsyncMock) as mock_ipc:
+        mock_ipc.return_value = {"template": "fedora-44", "cached": True}
+        from boxer_mcp.tools import box_prewarm_image
+        result = await box_prewarm_image(template="fedora-44")
+        assert mock_ipc.call_args[0] == ("image.prewarm", {"template": "fedora-44"})
+        assert result["cached"] is True
+
+
+@pytest.mark.asyncio
 async def test_box_request_installer_passes_params() -> None:
     with patch("boxer_mcp.tools.ipc", new_callable=AsyncMock) as mock_ipc:
         mock_ipc.return_value = {"vm_id": "vm_iso01", "install_state": "installing"}

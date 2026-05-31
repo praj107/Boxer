@@ -17,6 +17,30 @@ async def box_resource_status() -> dict[str, Any]:
 
 
 @mcp.tool()
+async def box_list_images() -> list[dict[str, Any]]:
+    """List available image/ISO templates with family, refresh policy, and local cache status.
+
+    Read-only and offline — does not trigger any download. Use this to discover
+    template names before box_request_vm / box_request_installer, and to see
+    which images are already warmed (cached) on the host.
+    """
+    result = await ipc("image.list", {})
+    return result["images"]
+
+
+@mcp.tool()
+async def box_prewarm_image(
+    template: Annotated[str, "Template name to fetch and verify into the host cache ahead of time"],
+) -> dict[str, Any]:
+    """Pre-fetch and verify a catalog image/ISO so later box_request_vm calls start instantly.
+
+    Downloads the allowlisted artifact (if not already cached), verifies it, and
+    returns the cached path and verified digest. Safe to call repeatedly.
+    """
+    return await ipc("image.prewarm", {"template": template})
+
+
+@mcp.tool()
 async def box_request_vm(
     template: Annotated[str, "OS template name (e.g. ubuntu-24.04, debian-12, fedora-44)"],
     purpose: Annotated[str, "Short name/purpose for the VM, used as hostname prefix"],
@@ -25,15 +49,26 @@ async def box_request_vm(
     cpu: Annotated[Optional[int], "Number of vCPUs (default from template)"] = None,
     ram_mb: Annotated[Optional[int], "RAM in MiB (default from template)"] = None,
     disk_gb: Annotated[Optional[int], "Disk size in GiB (default from template)"] = None,
+    profiles: Annotated[Optional[list[str]], "Named bootstrap profiles to apply (see box_list_profiles): python, node, docker, browser, desktop. Max 5."] = None,
     bootstrap_packages: Annotated[Optional[list[str]], "Packages to install during first boot via cloud-init"] = None,
     bootstrap_commands: Annotated[Optional[list[str]], "Shell commands to run during first boot via cloud-init"] = None,
+    write_files: Annotated[Optional[list[dict[str, str]]], "Files to inject: list of {path (absolute), content, permissions? (e.g. 0644), owner? (e.g. root:root)}. Max 20 files, 256 KiB each."] = None,
+    secret_files: Annotated[Optional[list[dict[str, str]]], "One-time secret files: same shape as write_files but default mode 0600/boxer; contents are never logged and the cloud-init cache copy is wiped after first boot."] = None,
     ssh_public_keys: Annotated[Optional[list[str]], "Additional OpenSSH public keys to authorize for the boxer user"] = None,
     ssh_access: Annotated[bool, "Generate and authorize a per-VM ephemeral SSH key"] = False,
     return_ssh_private_key: Annotated[bool, "Include the generated private key in the response; only use when direct SSH is required"] = False,
     wait_for_ip_seconds: Annotated[int, "Wait this many seconds for guest-agent IP discovery before returning"] = 0,
+    wait_for: Annotated[Optional[list[str]], "Readiness conditions to wait for before returning: guest_agent, ip, ssh, cloud_init, package_install."] = None,
+    wait_command: Annotated[Optional[str], "A command that must exit 0 (polled until wait_timeout_seconds) before returning"] = None,
+    wait_timeout_seconds: Annotated[int, "Max seconds to wait for wait_for/wait_command conditions (capped at 900)"] = 0,
     tags: Annotated[Optional[dict[str, str]], "Optional key-value tags"] = None,
 ) -> dict[str, Any]:
-    """Request a new VM. Returns vm_id when created, or queued status if host is at capacity."""
+    """Request a new VM. Returns vm_id when created, or queued status if host is at capacity.
+
+    Profiles and write_files/secret_files keep first-boot setup to one bounded
+    request instead of a setup transcript. Optional wait_for conditions let the
+    call return only once the VM is actually ready (SSH up, cloud-init done).
+    """
     params: dict[str, Any] = {"template": template, "purpose": purpose, "headless": headless, "ttl_minutes": ttl_minutes}
     if cpu is not None:
         params["cpu"] = cpu
@@ -41,10 +76,16 @@ async def box_request_vm(
         params["ram_mb"] = ram_mb
     if disk_gb is not None:
         params["disk_gb"] = disk_gb
+    if profiles:
+        params["profiles"] = profiles
     if bootstrap_packages:
         params["bootstrap_packages"] = bootstrap_packages
     if bootstrap_commands:
         params["bootstrap_commands"] = bootstrap_commands
+    if write_files:
+        params["write_files"] = write_files
+    if secret_files:
+        params["secret_files"] = secret_files
     if ssh_public_keys:
         params["ssh_public_keys"] = ssh_public_keys
     if ssh_access:
@@ -53,9 +94,22 @@ async def box_request_vm(
         params["return_ssh_private_key"] = return_ssh_private_key
     if wait_for_ip_seconds:
         params["wait_for_ip_seconds"] = wait_for_ip_seconds
+    if wait_for:
+        params["wait_for"] = wait_for
+    if wait_command:
+        params["wait_command"] = wait_command
+    if wait_timeout_seconds:
+        params["wait_timeout_seconds"] = wait_timeout_seconds
     if tags:
         params["tags"] = tags
     return await ipc("vm.request", params)
+
+
+@mcp.tool()
+async def box_list_profiles() -> list[dict[str, Any]]:
+    """List the named bootstrap profiles available for box_request_vm (offline, read-only)."""
+    result = await ipc("profile.list", {})
+    return result["profiles"]
 
 
 @mcp.tool()

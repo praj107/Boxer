@@ -14,10 +14,21 @@
 # Signatures default to required: false so a fresh install verifies by checksum
 # manifest out of the box. After installing the trusted keyrings into
 # /etc/boxer/keyrings (see keyrings/README.md), flip required: true to fail closed.
+#
+# Families and refresh policy (Milestone 4):
+#   family          groups templates by distro (ubuntu/debian/fedora/almalinux/rocky/arch)
+#   refresh_policy  pinned | latest | manual
+#     pinned  exact hash required (static sha256 or a manifest digest); never auto-refreshed
+#     latest  refresh the cached blob whenever the upstream manifest digest changes (default)
+#     manual  serve the cached blob until an admin runs `boxer image-refresh`
+# Artifacts are cached content-addressed by verified digest, so multiple verified
+# versions can coexist; `boxer prune` removes old blobs no longer in use.
 
 images:
   ubuntu-24.04:
     type: cloud-image
+    family: ubuntu
+    refresh_policy: latest
     description: "Ubuntu 24.04 LTS (Noble Numbat)"
     url: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
     sha256: null
@@ -37,6 +48,8 @@ images:
 
   ubuntu-22.04:
     type: cloud-image
+    family: ubuntu
+    refresh_policy: latest
     description: "Ubuntu 22.04 LTS (Jammy Jellyfish)"
     url: "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
     sha256: null
@@ -56,6 +69,8 @@ images:
 
   debian-12:
     type: cloud-image
+    family: debian
+    refresh_policy: latest
     description: "Debian 12 (Bookworm)"
     url: "https://cdimage.debian.org/cdimage/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"
     sha256: null
@@ -75,6 +90,8 @@ images:
 
   fedora-44:
     type: cloud-image
+    family: fedora
+    refresh_policy: latest
     description: "Fedora 44 Cloud Base"
     url: "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2"
     sha256: null
@@ -94,8 +111,50 @@ images:
     default_ram_mb: 2048
     default_disk_gb: 20
 
+  almalinux-9:
+    type: cloud-image
+    family: almalinux
+    refresh_policy: latest
+    description: "AlmaLinux 9 GenericCloud"
+    url: "https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2"
+    sha256: null
+    verification:
+      mode: checksum-manifest
+      checksum_url: "https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/CHECKSUM"
+      checksum_algorithm: sha256
+      checksum_filename: "AlmaLinux-9-GenericCloud-latest.x86_64.qcow2"
+      signature:
+        # AlmaLinux ships CHECKSUM as an inline PGP clearsigned message.
+        mode: clearsigned
+        keyring: "almalinux-9-keyring.gpg"
+        required: false
+    default_cpu: 2
+    default_ram_mb: 2048
+    default_disk_gb: 20
+
+  rocky-9:
+    type: cloud-image
+    family: rocky
+    refresh_policy: latest
+    description: "Rocky Linux 9 GenericCloud"
+    url: "https://download.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud.latest.x86_64.qcow2"
+    sha256: null
+    verification:
+      # Rocky publishes a per-file CHECKSUM (SHA256 (file) = hash). Signature
+      # verification keyring is admin-provided; add a verification.signature
+      # block once the Rocky release keyring is installed.
+      mode: checksum-manifest
+      checksum_url: "https://download.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud.latest.x86_64.qcow2.CHECKSUM"
+      checksum_algorithm: sha256
+      checksum_filename: "Rocky-9-GenericCloud.latest.x86_64.qcow2"
+    default_cpu: 2
+    default_ram_mb: 2048
+    default_disk_gb: 20
+
   arch-latest:
     type: iso
+    family: arch
+    refresh_policy: latest
     description: "Arch Linux (latest ISO)"
     url: "https://geo.mirror.pkgbuild.com/iso/latest/archlinux-x86_64.iso"
     sha256: null
@@ -115,6 +174,8 @@ images:
   #
   # ubuntu-24.04-installer:
   #   type: iso
+  #   family: ubuntu
+  #   refresh_policy: pinned
   #   description: "Ubuntu 24.04 live-server (autoinstall)"
   #   url: "https://releases.ubuntu.com/24.04/ubuntu-24.04.X-live-server-amd64.iso"
   #   sha256: null

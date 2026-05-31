@@ -88,6 +88,28 @@ def _artifact_type(entry: dict) -> str:
     return str(entry.get("artifact_type") or entry.get("type") or "cloud-image")
 
 
+_VALID_REFRESH_POLICIES = {"pinned", "latest", "manual"}
+
+
+def _refresh_policy(entry: dict) -> str:
+    """Resolve a catalog entry's refresh policy.
+
+    Explicit ``refresh_policy`` wins. Otherwise an entry with a static ``sha256``
+    pin defaults to ``pinned``; everything else defaults to ``latest`` (refresh
+    when the upstream manifest digest changes).
+    """
+    explicit = entry.get("refresh_policy")
+    if explicit is not None:
+        policy = str(explicit).lower()
+        if policy not in _VALID_REFRESH_POLICIES:
+            raise IPCError(
+                ERR_INVALID_PARAMS,
+                f"Invalid refresh_policy '{explicit}'. Valid: {sorted(_VALID_REFRESH_POLICIES)}",
+            )
+        return policy
+    return "pinned" if entry.get("sha256") else "latest"
+
+
 def _validate_hash_algorithm(algorithm: str) -> str:
     normalized = algorithm.lower()
     if normalized not in _SUPPORTED_HASHES:
@@ -162,20 +184,20 @@ class ImageManager:
         root = self._cfg.isos_dir if iso else self._cfg.images_dir
         return root / name
 
-    def _base_path(self, name: str, *, iso: bool = False) -> Path:
-        return self._cache_dir(name, iso=iso) / ("installer.iso" if iso else "base.qcow2")
+    def _blob_dir(self, name: str, *, iso: bool = False) -> Path:
+        return self._cache_dir(name, iso=iso) / "blobs"
 
-    def _checksum_path(self, name: str, *, iso: bool = False) -> Path:
-        return self._cache_dir(name, iso=iso) / "checksum.txt"
+    def _blob_path(self, name: str, algorithm: str, digest: str, *, iso: bool = False) -> Path:
+        ext = "iso" if iso else "qcow2"
+        return self._blob_dir(name, iso=iso) / f"{algorithm}-{digest}.{ext}"
 
     def _metadata_path(self, name: str, *, iso: bool = False) -> Path:
         return self._cache_dir(name, iso=iso) / "metadata.json"
 
     def is_cached(self, name: str, *, iso: bool = False) -> bool:
-        p = self._base_path(name, iso=iso)
-        return p.exists() and self._checksum_path(name, iso=iso).exists()
+        return self._current_blob(self._read_metadata(name, iso=iso), name, iso=iso) is not None
 
-    async def ensure_image(self, name: str) -> Path:
+    async def ensure_image(self, name: str, *, force: bool = False) -> Path:
         """Fetch and verify a cloud-image base disk. Rejects installer ISO templates."""
         entry = self._require_entry(name)
         artifact_type = _artifact_type(entry)
@@ -185,9 +207,9 @@ class ImageManager:
                 f"Template '{name}' is type '{artifact_type}'. Use the ISO installer workflow "
                 "(vm.request_installer / box_request_installer) for installer ISO templates.",
             )
-        return await self._ensure_artifact(name, entry, iso=False)
+        return await self._ensure_artifact(name, entry, iso=False, force=force)
 
-    async def ensure_iso(self, name: str) -> Path:
+    async def ensure_iso(self, name: str, *, force: bool = False) -> Path:
         """Fetch and verify an installer ISO into the ISO cache (separate from images)."""
         entry = self._require_entry(name)
         artifact_type = _artifact_type(entry)
@@ -196,7 +218,7 @@ class ImageManager:
                 ERR_INVALID_PARAMS,
                 f"Template '{name}' is type '{artifact_type}', not an installer ISO.",
             )
-        return await self._ensure_artifact(name, entry, iso=True)
+        return await self._ensure_artifact(name, entry, iso=True, force=force)
 
     def _require_entry(self, name: str) -> dict:
         entry = self._catalog.get(name)
@@ -207,26 +229,60 @@ class ImageManager:
             )
         return entry
 
-    async def _ensure_artifact(self, name: str, entry: dict, *, iso: bool) -> Path:
+    async def _ensure_artifact(self, name: str, entry: dict, *, iso: bool, force: bool = False) -> Path:
         kind = "ISO" if iso else "image"
-        base_path = self._base_path(name, iso=iso)
         url = entry["url"]
         _validate_url(url)
+        policy = _refresh_policy(entry)
+        meta = self._read_metadata(name, iso=iso)
+
+        # manual: serve the cached current artifact without contacting upstream,
+        # unless an admin explicitly forces a refresh or nothing is cached yet.
+        if policy == "manual" and not force:
+            current = self._current_blob(meta, name, iso=iso)
+            if current is not None:
+                logger.debug("%s %s served from manual-pinned cache %s", kind, name, current)
+                return current
+
         expected = await self._expected_digest(entry, url)
 
-        cached = self._read_cached_digest(name, iso=iso)
-        if self.is_cached(name, iso=iso) and self._cache_matches_expected(cached, expected):
-            logger.debug("%s %s already cached at %s", kind, name, base_path)
-            return base_path
-        if self.is_cached(name, iso=iso) and expected is not None:
-            logger.info("Cached %s %s no longer matches expected digest; refreshing", kind, name)
-            base_path.unlink(missing_ok=True)
-            self._checksum_path(name, iso=iso).unlink(missing_ok=True)
+        if expected is not None:
+            blob = self._blob_path(name, expected.algorithm, expected.digest, iso=iso)
+            if blob.exists():
+                # Verified content already on disk; (re)point current at it.
+                self._set_current(name, iso, policy, url, expected)
+                if not force:
+                    logger.debug("%s %s already cached at %s", kind, name, blob)
+                    return blob
+                logger.info("%s %s already at requested digest; refresh is a no-op", kind, name)
+                return blob
+            return await self._download_to_blob(name, iso, url, policy, expected)
 
+        # No static pin and no checksum manifest to resolve a digest.
+        if policy == "pinned":
+            raise IPCError(
+                ERR_INVALID_PARAMS,
+                f"refresh_policy 'pinned' for {name} requires a static sha256 or a checksum manifest",
+            )
+        current = self._current_blob(meta, name, iso=iso)
+        if current is not None and not force:
+            return current
+        return await self._download_to_blob(name, iso, url, policy, None)
+
+    async def _download_to_blob(
+        self,
+        name: str,
+        iso: bool,
+        url: str,
+        policy: str,
+        expected: Optional[ExpectedDigest],
+    ) -> Path:
+        kind = "ISO" if iso else "image"
+        blob_dir = self._blob_dir(name, iso=iso)
+        blob_dir.mkdir(parents=True, exist_ok=True)
         logger.info("Fetching %s %s from %s", kind, name, url)
-        base_path.parent.mkdir(parents=True, exist_ok=True)
 
-        tmp_path = Path(tempfile.mktemp(dir=base_path.parent, suffix=".tmp"))
+        tmp_path = Path(tempfile.mktemp(dir=blob_dir, suffix=".tmp"))
         try:
             await self._download(url, tmp_path)
             algorithm = expected.algorithm if expected else "sha256"
@@ -238,10 +294,12 @@ class ImageManager:
                     f"{algorithm.upper()} mismatch for {name}: expected {expected.digest}, got {actual_digest}",
                 )
 
-            tmp_path.rename(base_path)
-            self._write_cache_metadata(name, url, algorithm, actual_digest, expected, iso=iso)
+            blob = self._blob_path(name, algorithm, actual_digest, iso=iso)
+            tmp_path.rename(blob)
+            resolved = expected or ExpectedDigest(algorithm, actual_digest, "download hash only")
+            self._set_current(name, iso, policy, url, resolved)
             logger.info("%s %s cached, %s=%s", kind, name, algorithm, actual_digest)
-            return base_path
+            return blob
         except Exception:
             if tmp_path.exists():
                 tmp_path.unlink(missing_ok=True)
@@ -291,6 +349,168 @@ class ImageManager:
                 row.update(status="checksum-only", detail=expected.source, algorithm=expected.algorithm)
             reports.append(row)
         return reports
+
+    def list_images(self) -> list[dict]:
+        """List catalog entries with family, policy, and local cache status.
+
+        Pure local read — no network — so agents and admins can browse what is
+        available and what is already warmed without triggering a download.
+        """
+        rows: list[dict] = []
+        for name in self._catalog.list_names():
+            entry = self._catalog.get(name) or {}
+            artifact_type = _artifact_type(entry)
+            iso = artifact_type == "iso"
+            meta = self._read_metadata(name, iso=iso)
+            current = (meta or {}).get("current") or {}
+            cached = self._current_blob(meta, name, iso=iso) is not None
+            rows.append(
+                {
+                    "template": name,
+                    "family": entry.get("family"),
+                    "artifact_type": artifact_type,
+                    "description": entry.get("description"),
+                    "refresh_policy": _refresh_policy(entry),
+                    "default_cpu": entry.get("default_cpu"),
+                    "default_ram_mb": entry.get("default_ram_mb"),
+                    "default_disk_gb": entry.get("default_disk_gb"),
+                    "install_method": (entry.get("install") or {}).get("method") if iso else None,
+                    "cached": cached,
+                    "current_digest": (
+                        f"{current['algorithm']}:{current['digest']}" if cached and current else None
+                    ),
+                    "verified_at": current.get("verified_at") if cached else None,
+                    "signature_verified": bool(current.get("signature_verified")) if cached else False,
+                }
+            )
+        return rows
+
+    async def refresh_image(self, name: str) -> dict:
+        """Force re-evaluation of a template's cache per its refresh policy (admin)."""
+        entry = self._require_entry(name)
+        iso = _artifact_type(entry) == "iso"
+        if iso:
+            await self.ensure_iso(name, force=True)
+        else:
+            await self.ensure_image(name, force=True)
+        meta = self._read_metadata(name, iso=iso) or {}
+        current = meta.get("current") or {}
+        return {
+            "template": name,
+            "artifact_type": meta.get("artifact_type"),
+            "refresh_policy": meta.get("refresh_policy"),
+            "current_digest": f"{current.get('algorithm')}:{current.get('digest')}",
+            "verified_at": current.get("verified_at"),
+            "signature_verified": bool(current.get("signature_verified")),
+        }
+
+    async def prune(self, older_than_seconds: int = 0, dry_run: bool = False) -> dict:
+        """Remove cached base artifacts that are not current and not in use.
+
+        Protected from removal: the current blob of every template, and any blob
+        referenced as a backing file by an existing VM overlay. Legacy
+        single-file caches (``base.qcow2`` / ``installer.iso``) are also removed
+        when unreferenced.
+        """
+        loop = asyncio.get_running_loop()
+        protected = self._collect_current_blobs()
+        in_use, backing_known = await loop.run_in_executor(None, self._collect_backing_files)
+        protected |= in_use
+        cutoff = datetime.now(timezone.utc).timestamp() - max(0, older_than_seconds)
+
+        removed: list[dict] = []
+        freed = 0
+        for blob in self._iter_cached_artifacts():
+            real = blob.resolve()
+            if real in protected:
+                continue
+            # Without backing-chain info we cannot prove a blob is unused; only
+            # prune the loose legacy files, never digest blobs, to stay safe.
+            if not backing_known and blob.parent.name == "blobs":
+                continue
+            try:
+                st = blob.stat()
+            except OSError:
+                continue
+            if st.st_mtime > cutoff:
+                continue
+            removed.append({"path": str(blob), "bytes": st.st_size})
+            freed += st.st_size
+            if not dry_run:
+                blob.unlink(missing_ok=True)
+
+        return {
+            "dry_run": dry_run,
+            "removed_count": len(removed),
+            "freed_bytes": freed,
+            "backing_chain_known": backing_known,
+            "removed": removed,
+        }
+
+    def _collect_current_blobs(self) -> set[Path]:
+        protected: set[Path] = set()
+        for root, iso in ((self._cfg.images_dir, False), (self._cfg.isos_dir, True)):
+            if not root.exists():
+                continue
+            for tmpl_dir in root.iterdir():
+                if not tmpl_dir.is_dir():
+                    continue
+                blob = self._current_blob(self._read_metadata(tmpl_dir.name, iso=iso), tmpl_dir.name, iso=iso)
+                if blob is not None:
+                    protected.add(blob.resolve())
+        return protected
+
+    def _iter_cached_artifacts(self):
+        for root in (self._cfg.images_dir, self._cfg.isos_dir):
+            if not root.exists():
+                continue
+            for tmpl_dir in root.iterdir():
+                if not tmpl_dir.is_dir():
+                    continue
+                blob_dir = tmpl_dir / "blobs"
+                if blob_dir.is_dir():
+                    for blob in blob_dir.iterdir():
+                        if blob.is_file() and blob.suffix in (".qcow2", ".iso"):
+                            yield blob
+                # Legacy single-file caches from before digest-addressing.
+                for legacy in ("base.qcow2", "installer.iso"):
+                    p = tmpl_dir / legacy
+                    if p.is_file():
+                        yield p
+
+    def _collect_backing_files(self) -> tuple[set[Path], bool]:
+        """Return (backing files referenced by overlays, whether detection worked)."""
+        import subprocess
+
+        projects_dir = self._cfg.projects_dir
+        if not projects_dir.exists():
+            return set(), True
+        in_use: set[Path] = set()
+        known = True
+        for overlay in projects_dir.rglob("disk.qcow2"):
+            try:
+                out = subprocess.run(
+                    ["qemu-img", "info", "--output=json", "--backing-chain", str(overlay)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            except FileNotFoundError:
+                return set(), False  # qemu-img missing: cannot prove anything unused
+            except subprocess.CalledProcessError:
+                known = False
+                continue
+            try:
+                chain = json.loads(out.stdout)
+            except json.JSONDecodeError:
+                known = False
+                continue
+            for node in chain:
+                for key in ("full-backing-filename", "backing-filename"):
+                    backing = node.get(key)
+                    if backing:
+                        in_use.add(Path(backing).resolve())
+        return in_use, known
 
     async def _expected_digest(self, entry: dict, url: str) -> Optional[ExpectedDigest]:
         sha256 = entry.get("sha256")
@@ -379,52 +599,63 @@ class ImageManager:
         signer = result.fingerprints[0] if result.fingerprints else "verified"
         return f"pgp signature verified via {keyring.name} (key {signer})"
 
-    def _read_cached_digest(self, name: str, *, iso: bool = False) -> Optional[ExpectedDigest]:
-        path = self._checksum_path(name, iso=iso)
+    # --- digest-addressed cache metadata ---
+
+    def _read_metadata(self, name: str, *, iso: bool = False) -> Optional[dict]:
+        path = self._metadata_path(name, iso=iso)
         if not path.exists():
             return None
-        raw = path.read_text().strip()
-        if not raw:
+        try:
+            return json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
             return None
-        if ":" in raw:
-            algorithm, digest = raw.split(":", 1)
-            return ExpectedDigest(_validate_hash_algorithm(algorithm), digest.lower(), "cache")
-        return ExpectedDigest("sha256", raw.lower(), "legacy cache")
 
-    @staticmethod
-    def _cache_matches_expected(
-        cached: Optional[ExpectedDigest],
-        expected: Optional[ExpectedDigest],
-    ) -> bool:
-        if cached is None:
-            return expected is None
-        if expected is None:
-            return True
-        return cached.algorithm == expected.algorithm and cached.digest == expected.digest
+    def _current_blob(self, meta: Optional[dict], name: str, *, iso: bool = False) -> Optional[Path]:
+        """Resolve the metadata 'current' pointer to an existing blob, or None."""
+        if not meta:
+            return None
+        current = meta.get("current") or {}
+        algorithm, digest = current.get("algorithm"), current.get("digest")
+        if not algorithm or not digest:
+            return None
+        blob = self._blob_path(name, algorithm, digest, iso=iso)
+        return blob if blob.exists() else None
 
-    def _write_cache_metadata(
+    def _set_current(
         self,
         name: str,
+        iso: bool,
+        policy: str,
         url: str,
-        algorithm: str,
-        digest: str,
-        expected: Optional[ExpectedDigest],
-        *,
-        iso: bool = False,
+        expected: ExpectedDigest,
     ) -> None:
-        self._checksum_path(name, iso=iso).write_text(f"{algorithm}:{digest}\n")
-        metadata = {
-            "template": name,
-            "artifact_type": "iso" if iso else "cloud-image",
+        """Write the metadata pointer + provenance for the active verified digest."""
+        meta = self._read_metadata(name, iso=iso) or {}
+        now = datetime.now(timezone.utc).isoformat()
+        current = {
+            "algorithm": expected.algorithm,
+            "digest": expected.digest,
+            "blob": self._blob_path(name, expected.algorithm, expected.digest, iso=iso).name,
             "url": url,
-            "algorithm": algorithm,
-            "digest": digest,
-            "verified_at": datetime.now(timezone.utc).isoformat(),
-            "verification_source": expected.source if expected else "download hash only",
-            "signature_verified": bool(expected and expected.signature),
-            "signature_provenance": expected.signature if expected else None,
+            "verified_at": now,
+            "verification_source": expected.source,
+            "signature_verified": bool(expected.signature),
+            "signature_provenance": expected.signature,
         }
-        self._metadata_path(name, iso=iso).write_text(json.dumps(metadata, indent=2) + "\n")
+        history = meta.get("history") or []
+        ident = f"{expected.algorithm}:{expected.digest}"
+        history = [h for h in history if f"{h.get('algorithm')}:{h.get('digest')}" != ident]
+        history.insert(0, {"algorithm": expected.algorithm, "digest": expected.digest, "verified_at": now})
+        meta.update(
+            {
+                "template": name,
+                "artifact_type": "iso" if iso else "cloud-image",
+                "refresh_policy": policy,
+                "current": current,
+                "history": history[:10],
+            }
+        )
+        self._metadata_path(name, iso=iso).write_text(json.dumps(meta, indent=2) + "\n")
 
     async def _download(self, url: str, dest: Path) -> None:
         async with httpx.AsyncClient(follow_redirects=False, timeout=3600) as client:

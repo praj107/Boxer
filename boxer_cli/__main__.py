@@ -200,12 +200,101 @@ def cleanup(dry_run: bool, interactive: bool) -> None:
             click.echo(f"  Failed to delete {v['vm_id']}: {exc}", err=True)
 
 
+def _parse_age(spec: str) -> int:
+    """Parse an age like '7d', '24h', '30m', '90s' into seconds."""
+    spec = spec.strip().lower()
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if spec and spec[-1] in units:
+        try:
+            return int(float(spec[:-1]) * units[spec[-1]])
+        except ValueError:
+            pass
+    try:
+        return int(spec)  # bare number = seconds
+    except ValueError:
+        raise click.BadParameter(f"Invalid age '{spec}'. Use e.g. 7d, 24h, 30m, 90s.")
+
+
+def _fmt_bytes(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            return f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{n}B"
+
+
+@cli.command("images")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON")
+def images(as_json: bool) -> None:
+    """List catalog image/ISO templates with family, policy, and cache status."""
+    result = _run(_call("image.list", {}))
+    rows = result.get("images", [])
+    if as_json:
+        click.echo(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        click.echo("No catalog templates configured.")
+        return
+    click.echo(f"{'TEMPLATE':<22} {'FAMILY':<10} {'TYPE':<12} {'POLICY':<8} {'CACHED':<7} DIGEST")
+    click.echo("-" * 90)
+    for r in rows:
+        cached = "yes" if r.get("cached") else "-"
+        digest = (r.get("current_digest") or "")[:23]
+        sig = " ✓sig" if r.get("signature_verified") else ""
+        click.echo(
+            f"{r['template']:<22} {(r.get('family') or '-'):<10} "
+            f"{r.get('artifact_type', '-'):<12} {r.get('refresh_policy', '-'):<8} "
+            f"{cached:<7} {digest}{sig}"
+        )
+
+
+@cli.command("profiles")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON")
+def profiles(as_json: bool) -> None:
+    """List named bootstrap profiles available for VM requests."""
+    result = _run(_call("profile.list", {}))
+    rows = result.get("profiles", [])
+    if as_json:
+        click.echo(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        click.echo("No profiles configured.")
+        return
+    for p in rows:
+        click.echo(f"{p['name']:<10} {p['description']}")
+        click.echo(f"           packages: {', '.join(p['packages'])}")
+
+
+@cli.command("image-refresh")
+@click.argument("template")
+def image_refresh(template: str) -> None:
+    """Force a catalog image to re-evaluate its cache per its refresh policy (admin)."""
+    result = _run(_call("image.refresh", {"template": template}))
+    click.echo(
+        f"{result['template']}: {result.get('current_digest')} "
+        f"(policy={result.get('refresh_policy')}, "
+        f"signature={'verified' if result.get('signature_verified') else 'unverified'})"
+    )
+
+
 @cli.command("prune")
 @click.option("--older-than", default="7d", show_default=True, help="Age threshold e.g. 7d, 24h")
 @click.option("--dry-run", is_flag=True)
 def prune(older_than: str, dry_run: bool) -> None:
-    """Remove stopped VMs older than a threshold."""
-    click.echo(f"Prune --older-than {older_than} (dry_run={dry_run}): use cleanup for now.")
+    """Remove cached base image/ISO artifacts that are old and no longer in use (admin)."""
+    seconds = _parse_age(older_than)
+    result = _run(_call("image.prune", {"older_than_seconds": seconds, "dry_run": dry_run}))
+    removed = result.get("removed", [])
+    if not removed:
+        click.echo("No prunable cached artifacts found.")
+        if not result.get("backing_chain_known", True):
+            click.echo("(qemu-img backing-chain info unavailable — digest blobs were protected.)")
+        return
+    prefix = "[dry-run] would remove" if dry_run else "Removed"
+    for item in removed:
+        click.echo(f"  {prefix}: {item['path']} ({_fmt_bytes(item['bytes'])})")
+    click.echo(f"{prefix.split()[0]} {result['removed_count']} artifact(s), {_fmt_bytes(result['freed_bytes'])}.")
 
 
 @cli.command("events")

@@ -121,27 +121,68 @@ Notes / deferred within this milestone:
 
 ## Milestone 4: Image Families and Refresh Policy
 
+Status: implemented in this branch.
+
 Improve catalog ergonomics without widening the attack surface.
 
-Planned work:
+Scope:
 
-- First-class image families for Ubuntu, Debian, Fedora, AlmaLinux, Rocky, and Arch.
-- `refresh_policy` support:
-  - `pinned`: exact hash required;
-  - `latest`: refresh when upstream manifest hash changes;
-  - `manual`: admin-triggered refresh only.
-- Cache by verified digest instead of only template name.
-- Add prune commands for old verified base artifacts.
-- Add image listing/prewarm tools for agents and admins.
+- First-class `family` tagging for Ubuntu, Debian, Fedora, AlmaLinux, Rocky, and
+  Arch; AlmaLinux 9 and Rocky 9 generic-cloud entries added to the catalog.
+- `refresh_policy` support resolved per entry (explicit field wins; static
+  `sha256` defaults to `pinned`, otherwise `latest`):
+  - `pinned`: exact hash required (static sha256 or a manifest digest); never
+    auto-refreshed, and rejected if no verifiable hash is configured;
+  - `latest`: cached blob is refreshed when the upstream manifest digest changes;
+  - `manual`: cached blob is served until an admin runs `boxer image-refresh`.
+- Content-addressed cache: artifacts are stored as
+  `<images|isos>/<template>/blobs/<algo>-<digest>.<ext>` with a `metadata.json`
+  carrying the current pointer, provenance, and verified-digest history, so
+  multiple verified versions can coexist and overlays keep their exact backing.
+- `boxer prune` removes old cached base artifacts that are neither the current
+  blob nor referenced as a backing file by any existing overlay (backing chains
+  resolved via `qemu-img info --backing-chain`; falls back to protecting all
+  digest blobs when that information is unavailable).
+- Image listing/prewarm: `box_list_images` (offline catalog + cache status) and
+  `box_prewarm_image` for agents; `boxer images`, `boxer image-refresh`, and
+  admin IPC `image.list` / `image.refresh` / `image.prune` / `image.prewarm`.
+
+Notes:
+
+- The Rocky entry verifies by checksum manifest only; its signing keyring is
+  admin-provided (add a `verification.signature` block once installed).
+- Pruning ISO blobs protects the current blob; non-current installer ISOs are
+  best-effort since cdrom references are not tracked in backing chains.
 
 ## Milestone 5: Rich Guest Profiles
 
+Status: implemented in this branch.
+
 Make common agent VM setups one request instead of a setup transcript.
 
-Planned work:
+Scope:
 
-- Named bootstrap profiles such as `python`, `node`, `browser`, `docker`, and `desktop`.
-- Optional wait conditions: SSH ready, package install complete, command success, guest-agent ready.
-- File injection through cloud-init `write_files`.
-- Secret handling rules for one-time credentials and private material.
-- MCP schemas that keep setup inputs bounded and explicit.
+- Named bootstrap profiles (`boxerd/profiles.py`): `python`, `node`, `browser`,
+  `docker`, `desktop`. A closed allowlist (max 5 per request) that expands into
+  deduped cloud-init packages + setup commands, merged with any explicit
+  `bootstrap_packages` / `bootstrap_commands`.
+- Optional wait conditions on `vm.request`: `guest_agent`, `ip`, `ssh`,
+  `cloud_init` / `package_install`, plus an arbitrary `wait_command` that must
+  exit 0; bounded by `wait_timeout_seconds` (capped at 900). Per-condition
+  results (`ready`/`timeout`/`skipped`/`error`) are returned in `wait_results`.
+- File injection through cloud-init `write_files` (base64-encoded), bounded:
+  absolute paths, ≤20 files, ≤256 KiB each, ≤1 MiB total, octal permissions.
+- Secret handling: `secret_files` default to mode `0600` owned by `boxer`, their
+  contents are never written to events or returned payloads (only a count), and
+  a late cloud-init command wipes the persisted `user-data` copy from the
+  instance cache after first boot to limit secret residue on disk.
+- MCP schemas keep all of this bounded and explicit: `box_request_vm` gained
+  `profiles`, `write_files`, `secret_files`, `wait_for`, `wait_command`, and
+  `wait_timeout_seconds`; discovery via `box_list_profiles` (and `boxer profiles`).
+
+Notes:
+
+- Profiles target the Debian/Ubuntu package layer of the default cloud-image
+  families; on other families the package step is best-effort.
+- The seed-wipe is best-effort defence-in-depth; the cloud-init NoCloud ISO is
+  still the delivery vector, so treat `secret_files` as one-time material.
