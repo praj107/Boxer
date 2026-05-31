@@ -26,6 +26,10 @@ async def test_box_request_vm_passes_params() -> None:
             purpose="ci-runner",
             headless=True,
             ttl_minutes=30,
+            bootstrap_packages=["git"],
+            bootstrap_commands=["echo ready"],
+            ssh_access=True,
+            wait_for_ip_seconds=10,
         )
         call_args = mock_ipc.call_args
         assert call_args[0][0] == "vm.request"
@@ -33,6 +37,10 @@ async def test_box_request_vm_passes_params() -> None:
         assert params["template"] == "ubuntu-24.04"
         assert params["purpose"] == "ci-runner"
         assert params["ttl_minutes"] == 30
+        assert params["bootstrap_packages"] == ["git"]
+        assert params["bootstrap_commands"] == ["echo ready"]
+        assert params["ssh_access"] is True
+        assert params["wait_for_ip_seconds"] == 10
 
 
 @pytest.mark.asyncio
@@ -65,3 +73,28 @@ async def test_box_list_vms() -> None:
         vms = await box_list_vms()
         assert len(vms) == 1
         assert vms[0]["vm_id"] == "vm_abc"
+
+
+@pytest.mark.asyncio
+async def test_box_restart_vm_calls_ipc() -> None:
+    with patch("boxer_mcp.tools.ipc", new_callable=AsyncMock) as mock_ipc:
+        mock_ipc.return_value = {"vm_id": "vm_abc", "state": "running"}
+        from boxer_mcp.tools import box_restart_vm
+        await box_restart_vm(vm_id="vm_abc", graceful=False, wait_for_ip_seconds=5)
+        mock_ipc.assert_called_once_with(
+            "vm.restart",
+            {"vm_id": "vm_abc", "graceful": False, "wait_for_ip_seconds": 5},
+        )
+
+
+@pytest.mark.asyncio
+async def test_box_get_ssh_access_calls_ipc() -> None:
+    with patch("boxer_mcp.tools.ipc", new_callable=AsyncMock) as mock_ipc:
+        mock_ipc.return_value = {"username": "boxer"}
+        from boxer_mcp.tools import box_get_ssh_access
+        await box_get_ssh_access(vm_id="vm_abc", include_private_key=True, create=False)
+        params = mock_ipc.call_args[0][1]
+        assert mock_ipc.call_args[0][0] == "vm.ssh_access"
+        assert params["vm_id"] == "vm_abc"
+        assert params["include_private_key"] is True
+        assert params["create"] is False

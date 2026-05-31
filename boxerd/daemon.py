@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -22,6 +23,7 @@ from boxerd.network_ops import NetworkManager
 from boxerd.policy import PolicyEngine, caller_from_params
 from boxerd.reconcile import build_reconcile_report, parse_boxer_name, _extract_disk_path, _get_disk_size_gb
 from boxerd.scheduler import HostCapacity, Scheduler
+from boxerd.ssh_keys import SSHKeyManager, SSHKeyMaterial
 from boxerd.storage_ops import StorageManager
 from boxerd.vm_ops import VMOperations
 
@@ -35,6 +37,80 @@ def _make_vm_id() -> str:
 def _make_libvirt_name(project_id: str, display_name: str, vm_id: str) -> str:
     safe = "".join(c if c.isalnum() or c == "-" else "-" for c in display_name)[:30]
     return f"Boxer--{project_id}--{safe}--{vm_id}"
+
+
+_PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+_.:-]{0,127}$")
+
+
+def _string_list(
+    value: Any,
+    field: str,
+    *,
+    max_items: int,
+    max_len: int,
+) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise IPCError(ERR_INVALID_PARAMS, f"{field} must be a list of strings")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise IPCError(ERR_INVALID_PARAMS, f"{field} must be a list of strings")
+        item = item.strip()
+        if not item:
+            continue
+        if len(item) > max_len:
+            raise IPCError(ERR_INVALID_PARAMS, f"{field} entries must be <= {max_len} characters")
+        result.append(item)
+    if len(result) > max_items:
+        raise IPCError(ERR_INVALID_PARAMS, f"{field} accepts at most {max_items} entries")
+    return result
+
+
+def _bootstrap_from_params(params: dict[str, Any]) -> dict[str, list[str]]:
+    bootstrap = params.get("bootstrap") or {}
+    if bootstrap and not isinstance(bootstrap, dict):
+        raise IPCError(ERR_INVALID_PARAMS, "bootstrap must be an object")
+
+    packages = _string_list(
+        params.get("bootstrap_packages", bootstrap.get("packages")),
+        "bootstrap_packages",
+        max_items=50,
+        max_len=128,
+    )
+    invalid_packages = [pkg for pkg in packages if not _PACKAGE_RE.match(pkg)]
+    if invalid_packages:
+        raise IPCError(ERR_INVALID_PARAMS, f"Invalid package names: {invalid_packages}")
+
+    commands = _string_list(
+        params.get("bootstrap_commands", bootstrap.get("commands")),
+        "bootstrap_commands",
+        max_items=20,
+        max_len=2000,
+    )
+    ssh_public_keys = _string_list(
+        params.get("ssh_public_keys", bootstrap.get("ssh_public_keys")),
+        "ssh_public_keys",
+        max_items=10,
+        max_len=4096,
+    )
+    valid_prefixes = (
+        "ssh-ed25519 ",
+        "ssh-rsa ",
+        "ecdsa-sha2-",
+        "sk-ssh-ed25519@",
+        "sk-ecdsa-sha2-",
+    )
+    invalid_keys = [key for key in ssh_public_keys if not key.startswith(valid_prefixes)]
+    if invalid_keys:
+        raise IPCError(ERR_INVALID_PARAMS, "ssh_public_keys entries must be OpenSSH public keys")
+
+    return {
+        "packages": packages,
+        "commands": commands,
+        "ssh_public_keys": ssh_public_keys,
+    }
 
 
 class BoxerDaemon:
@@ -53,6 +129,7 @@ class BoxerDaemon:
         self._scheduler: Optional[Scheduler] = None
         self._lease_manager: Optional[LeaseManager] = None
         self._cloud_init = CloudInitBuilder()
+        self._ssh_keys = SSHKeyManager()
 
     async def start(self) -> None:
         logger.info("BoxerD starting")
@@ -100,6 +177,8 @@ class BoxerDaemon:
         reg("vm.get", self._h_vm_get)
         reg("vm.start", self._h_vm_start)
         reg("vm.stop", self._h_vm_stop)
+        reg("vm.restart", self._h_vm_restart)
+        reg("vm.ssh_access", self._h_vm_ssh_access)
         reg("vm.delete", self._h_vm_delete)
         reg("vm.extend_lease", self._h_vm_extend_lease)
         reg("vm.snapshot", self._h_vm_snapshot)
@@ -126,6 +205,10 @@ class BoxerDaemon:
         headless = bool(params.get("headless", True))
         ttl_minutes = int(params.get("ttl_minutes", self._cfg.default_ttl_minutes))
         tags = params.get("tags") or {}
+        bootstrap = _bootstrap_from_params(params)
+        ssh_access = bool(params.get("ssh_access", False) or params.get("return_ssh_private_key", False))
+        return_ssh_private_key = bool(params.get("return_ssh_private_key", False))
+        wait_for_ip_seconds = int(params.get("wait_for_ip_seconds", 0) or 0)
 
         catalog_entry = self._image_manager._catalog.get(template)
         if catalog_entry is None:
@@ -148,9 +231,10 @@ class BoxerDaemon:
                 "reason": reason,
                 "retry_after_seconds": 60,
                 "current_capacity": self._capacity.get_status(),
+                "note": "If ssh_access was requested, retrieve it after promotion with box_get_ssh_access.",
             }
 
-        vm = await self._create_vm(
+        vm, ssh_access_info = await self._create_vm(
             caller_project_id=caller.project_id,
             caller_user=caller.user,
             template=template,
@@ -161,10 +245,18 @@ class BoxerDaemon:
             ram_mb=ram_mb,
             disk_gb=disk_gb,
             tags=tags,
+            bootstrap=bootstrap,
+            ssh_access=ssh_access,
+            include_private_key=return_ssh_private_key,
+            wait_for_ip_seconds=wait_for_ip_seconds,
         )
-        return _vm_to_dict(vm)
+        result = _vm_to_dict(vm)
+        if ssh_access_info:
+            result["ssh_access"] = ssh_access_info
+        return result
 
     async def _create_vm_from_request(self, request: dict[str, Any]) -> None:
+        request = {**request, "return_ssh_private_key": False}
         await self._h_vm_request(request)
 
     async def _create_vm(
@@ -180,11 +272,16 @@ class BoxerDaemon:
         ram_mb: int,
         disk_gb: int,
         tags: dict[str, str],
-    ) -> VMRecord:
+        bootstrap: Optional[dict[str, list[str]]] = None,
+        ssh_access: bool = False,
+        include_private_key: bool = False,
+        wait_for_ip_seconds: int = 0,
+    ) -> tuple[VMRecord, Optional[dict[str, Any]]]:
         vm_id = _make_vm_id()
         libvirt_name = _make_libvirt_name(caller_project_id, purpose, vm_id)
         now = datetime.now(timezone.utc)
         lease_until = now + timedelta(minutes=ttl_minutes)
+        bootstrap = bootstrap or {"packages": [], "commands": [], "ssh_public_keys": []}
 
         await self._db.upsert_project(caller_project_id, "unknown")
 
@@ -192,12 +289,21 @@ class BoxerDaemon:
         vm_dir = self._storage.vm_dir(caller_project_id, vm_id)
         overlay_path = await self._storage.create_overlay(caller_project_id, vm_id, base_path, disk_gb)
 
+        key_material: Optional[SSHKeyMaterial] = None
+        ssh_keys = list(bootstrap["ssh_public_keys"])
+        if ssh_access:
+            key_material = await self._ssh_keys.ensure_keypair(vm_dir, vm_id)
+            ssh_keys.append(key_material.public_key)
+
         ssh_pubkey = self._cfg.boxer_ssh_pubkey
         cloud_init_iso = await self._cloud_init.build(
             vm_id=vm_id,
             dest_dir=vm_dir,
             hostname=purpose[:20],
             ssh_pubkey=ssh_pubkey,
+            ssh_authorized_keys=ssh_keys,
+            packages=bootstrap["packages"],
+            runcmd=bootstrap["commands"],
         )
 
         net_name = self._network.ensure_project_network(caller_project_id)
@@ -238,7 +344,19 @@ class BoxerDaemon:
         )
         await self._db.insert_vm(vm)
 
-        asyncio.create_task(self._poll_ip(vm_id, libvirt_name))
+        if wait_for_ip_seconds > 0:
+            ip = await self._vm_ops.get_ip_via_guest_agent(
+                libvirt_name,
+                timeout=max(1, min(wait_for_ip_seconds, 300)),
+            )
+            if ip:
+                vm.ip_address = ip
+                await self._db.update_vm_ip(vm_id, ip)
+                logger.info("VM %s got IP %s", vm_id, ip)
+            else:
+                asyncio.create_task(self._poll_ip(vm_id, libvirt_name))
+        else:
+            asyncio.create_task(self._poll_ip(vm_id, libvirt_name))
 
         await self._db.add_event(
             "INFO",
@@ -246,13 +364,42 @@ class BoxerDaemon:
             project_id=caller_project_id,
             vm_id=vm_id,
         )
-        return vm
+        ssh_access_info = (
+            self._ssh_access_payload(vm, key_material, include_private_key)
+            if key_material
+            else None
+        )
+        return vm, ssh_access_info
 
     async def _poll_ip(self, vm_id: str, libvirt_name: str) -> None:
         ip = await self._vm_ops.get_ip_via_guest_agent(libvirt_name, timeout=120)
         if ip:
             await self._db.update_vm_ip(vm_id, ip)
             logger.info("VM %s got IP %s", vm_id, ip)
+
+    @staticmethod
+    def _ssh_access_payload(
+        vm: VMRecord,
+        key_material: SSHKeyMaterial,
+        include_private_key: bool,
+    ) -> dict[str, Any]:
+        host = vm.ip_address or "<pending-ip>"
+        payload: dict[str, Any] = {
+            "vm_id": vm.id,
+            "username": "boxer",
+            "host": vm.ip_address,
+            "public_key": key_material.public_key,
+            "private_key_path": str(key_material.private_key_path),
+            "ssh_command": (
+                f"ssh -i {key_material.private_key_path} "
+                "-o IdentitiesOnly=yes "
+                "-o StrictHostKeyChecking=accept-new "
+                f"boxer@{host}"
+            ),
+        }
+        if include_private_key:
+            payload["private_key"] = key_material.private_key
+        return payload
 
     # ------------------------------------------------------------------ vm.list
 
@@ -292,6 +439,7 @@ class BoxerDaemon:
     async def _h_vm_start(self, params: dict[str, Any]) -> dict[str, Any]:
         caller = caller_from_params(params)
         vm_id = params.get("vm_id")
+        wait_for_ip_seconds = int(params.get("wait_for_ip_seconds", 0) or 0)
         if not vm_id:
             raise IPCError(ERR_INVALID_PARAMS, "vm_id required")
         vm = await self._db.get_vm(vm_id)
@@ -300,7 +448,20 @@ class BoxerDaemon:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._vm_ops.start, vm.libvirt_name)
         await self._db.update_vm_state(vm_id, "running")
-        return {"vm_id": vm_id, "state": "running"}
+        vm.state = "running"
+        if wait_for_ip_seconds > 0:
+            ip = await self._vm_ops.get_ip_via_guest_agent(
+                vm.libvirt_name,
+                timeout=max(1, min(wait_for_ip_seconds, 300)),
+            )
+            if ip:
+                vm.ip_address = ip
+                await self._db.update_vm_ip(vm_id, ip)
+            else:
+                asyncio.create_task(self._poll_ip(vm_id, vm.libvirt_name))
+        else:
+            asyncio.create_task(self._poll_ip(vm_id, vm.libvirt_name))
+        return {"vm_id": vm_id, "state": "running", "ip_address": vm.ip_address}
 
     # ------------------------------------------------------------------ vm.stop
 
@@ -317,6 +478,84 @@ class BoxerDaemon:
         await loop.run_in_executor(None, self._vm_ops.stop, vm.libvirt_name, graceful)
         await self._db.update_vm_state(vm_id, "stopped")
         return {"vm_id": vm_id, "state": "stopped"}
+
+    # ------------------------------------------------------------------ vm.restart
+
+    async def _h_vm_restart(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        vm_id = params.get("vm_id")
+        graceful = bool(params.get("graceful", True))
+        wait_for_ip_seconds = int(params.get("wait_for_ip_seconds", 0) or 0)
+        if not vm_id:
+            raise IPCError(ERR_INVALID_PARAMS, "vm_id required")
+        vm = await self._db.get_vm(vm_id)
+        self._policy.check("vm.restart", caller, vm)
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._vm_ops.stop, vm.libvirt_name, graceful)
+        await loop.run_in_executor(None, self._vm_ops.start, vm.libvirt_name)
+        await self._db.update_vm_state(vm_id, "running")
+        vm.state = "running"
+
+        if wait_for_ip_seconds > 0:
+            ip = await self._vm_ops.get_ip_via_guest_agent(
+                vm.libvirt_name,
+                timeout=max(1, min(wait_for_ip_seconds, 300)),
+            )
+            if ip:
+                vm.ip_address = ip
+                await self._db.update_vm_ip(vm_id, ip)
+            else:
+                asyncio.create_task(self._poll_ip(vm_id, vm.libvirt_name))
+        else:
+            asyncio.create_task(self._poll_ip(vm_id, vm.libvirt_name))
+
+        return {"vm_id": vm_id, "state": "running", "ip_address": vm.ip_address}
+
+    # ------------------------------------------------------------------ vm.ssh_access
+
+    async def _h_vm_ssh_access(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        vm_id = params.get("vm_id")
+        include_private_key = bool(params.get("include_private_key", False))
+        create = bool(params.get("create", True))
+        timeout = int(params.get("timeout_seconds", 30) or 30)
+        if not vm_id:
+            raise IPCError(ERR_INVALID_PARAMS, "vm_id required")
+        vm = await self._db.get_vm(vm_id)
+        self._policy.check("vm.ssh_access", caller, vm)
+
+        vm_dir = self._storage.vm_dir(vm.project_id, vm_id)
+        key_exists = self._ssh_keys.has_key(vm_dir)
+        if not key_exists and not create:
+            raise IPCError(
+                ERR_NOT_FOUND,
+                "No ephemeral SSH key exists for this VM. Re-run with create=true.",
+            )
+        if not key_exists and not vm.ip_address:
+            raise IPCError(ERR_INVALID_PARAMS, "VM has no IP address yet; wait for boot before creating SSH access")
+
+        key_material = await self._ssh_keys.ensure_keypair(vm_dir, vm_id)
+        if not key_exists:
+            try:
+                await self._guest.install_ssh_public_key(
+                    vm.ip_address,
+                    key_material.public_key,
+                    timeout_seconds=timeout,
+                )
+            except Exception:
+                key_material.private_key_path.unlink(missing_ok=True)
+                key_material.public_key_path.unlink(missing_ok=True)
+                raise
+            await self._db.add_event(
+                "INFO",
+                f"Ephemeral SSH access created for '{vm.display_name}' ({vm_id})",
+                project_id=vm.project_id,
+                vm_id=vm_id,
+            )
+
+        await self._db.touch_vm(vm_id)
+        return self._ssh_access_payload(vm, key_material, include_private_key)
 
     # ------------------------------------------------------------------ vm.delete
 

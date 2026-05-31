@@ -37,6 +37,14 @@ def test_owner_can_stop_own_vm() -> None:
     policy.check("vm.stop", caller, vm)  # should not raise
 
 
+def test_owner_can_restart_and_get_ssh_access() -> None:
+    policy = PolicyEngine()
+    caller = CallerIdentity(project_id="p_aaa111", user="alice")
+    vm = _make_vm("p_aaa111", "alice")
+    policy.check("vm.restart", caller, vm)
+    policy.check("vm.ssh_access", caller, vm)
+
+
 def test_wrong_project_is_denied() -> None:
     policy = PolicyEngine()
     caller = CallerIdentity(project_id="p_bbb222", user="alice")

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import shlex
 import subprocess
 import tempfile
 from pathlib import Path
@@ -103,6 +104,21 @@ class GuestAgent:
             raise IPCError(ERR_INTERNAL, f"SSH exec timed out after {timeout_seconds}s")
         except Exception as exc:
             raise IPCError(ERR_INTERNAL, f"SSH exec failed: {exc}") from exc
+
+    async def install_ssh_public_key(
+        self,
+        ip_address: str,
+        public_key: str,
+        timeout_seconds: int = 30,
+    ) -> dict[str, Any]:
+        quoted_key = shlex.quote(public_key)
+        command = (
+            "mkdir -p ~/.ssh && chmod 700 ~/.ssh && "
+            "touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && "
+            f"grep -qxF {quoted_key} ~/.ssh/authorized_keys || "
+            f"printf '%s\\n' {quoted_key} >> ~/.ssh/authorized_keys"
+        )
+        return await self.exec_ssh(ip_address, command, timeout_seconds)
 
     async def send_keys(self, libvirt_name: str, keys: list[str]) -> None:
         uri = self._cfg.libvirt_uri

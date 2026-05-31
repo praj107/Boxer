@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from boxer.ipc import IPCError, ERR_INVALID_PARAMS
-from boxerd.image_catalog import _validate_url, _is_private_ip
+from boxerd.image_catalog import _parse_checksum_manifest, _validate_url, _is_private_ip
 
 
 def test_private_ip_detection() -> None:
@@ -49,3 +49,35 @@ def test_private_ip_url_rejected(monkeypatch) -> None:
     with pytest.raises(IPCError) as exc_info:
         _validate_url("https://internal.corp/image.qcow2")
     assert "private" in exc_info.value.message.lower()
+
+
+def test_parse_sha256sums_manifest() -> None:
+    text = """
+abc123  other.img
+4d967bd40fdef4c43a3d0a8d54e45efdbf55f4ebf1b7fcb13b6f70e27f20bc90 *noble-server-cloudimg-amd64.img
+"""
+    assert (
+        _parse_checksum_manifest(text, "noble-server-cloudimg-amd64.img", "sha256")
+        == "4d967bd40fdef4c43a3d0a8d54e45efdbf55f4ebf1b7fcb13b6f70e27f20bc90"
+    )
+
+
+def test_parse_fedora_checksum_manifest() -> None:
+    text = """
+# Fedora-Cloud-44-1.7-x86_64-CHECKSUM
+SHA256 (Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2) = 8f6e5d4c3b2a19081726354433221100ffeeddccbbaa99887766554433221100
+"""
+    assert (
+        _parse_checksum_manifest(
+            text,
+            "Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2",
+            "sha256",
+        )
+        == "8f6e5d4c3b2a19081726354433221100ffeeddccbbaa99887766554433221100"
+    )
+
+
+def test_parse_checksum_manifest_missing_file_rejected() -> None:
+    with pytest.raises(IPCError) as exc_info:
+        _parse_checksum_manifest("abc123  other.img\n", "missing.img", "sha256")
+    assert exc_info.value.code == ERR_INVALID_PARAMS

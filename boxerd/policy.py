@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 _OWNERSHIP_REQUIRED_ACTIONS = {
     "vm.start",
     "vm.stop",
+    "vm.restart",
+    "vm.ssh_access",
     "vm.delete",
     "vm.extend_lease",
     "vm.snapshot",

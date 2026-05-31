@@ -26,6 +26,8 @@ sudo bash scripts/setup.sh
 
 The script installs system packages, enables `libvirtd`, creates the `boxer-admin` group, generates an SSH keypair, installs the Python package to `/opt/boxer/venv`, and registers systemd services.
 
+**After setup, log out and back in** (or reboot) before starting the daemon or registering the MCP server. Group membership changes (`libvirt`, `kvm`, `boxer-admin`) are not visible to your running session until you do, and MCP clients will receive `EACCES` when trying to access `/opt/boxer/` without them.
+
 Start the daemon:
 
 ```bash

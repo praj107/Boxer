@@ -5,33 +5,13 @@ import asyncio
 import logging
 import subprocess
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+import yaml
+
 logger = logging.getLogger(__name__)
-
-_USER_DATA_TEMPLATE = """\
-#cloud-config
-hostname: {hostname}
-manage_etc_hosts: true
-
-users:
-  - name: boxer
-    groups: [sudo]
-    shell: /bin/bash
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    lock_passwd: true
-{ssh_keys_block}
-
-package_update: true
-packages:
-  - qemu-guest-agent
-  - openssh-server
-
-runcmd:
-  - systemctl enable --now qemu-guest-agent
-  - systemctl enable --now ssh
-"""
 
 _META_DATA_TEMPLATE = """\
 instance-id: {vm_id}
@@ -39,10 +19,51 @@ local-hostname: {hostname}
 """
 
 
-def _ssh_keys_block(pubkey: Optional[str]) -> str:
-    if not pubkey:
-        return ""
-    return f"    ssh_authorized_keys:\n      - {pubkey}\n"
+@dataclass(frozen=True)
+class CloudInitOptions:
+    ssh_authorized_keys: list[str] = field(default_factory=list)
+    packages: list[str] = field(default_factory=list)
+    runcmd: list[str] = field(default_factory=list)
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def _render_user_data(hostname: str, options: CloudInitOptions) -> str:
+    packages = _dedupe(["qemu-guest-agent", "openssh-server", *options.packages])
+    runcmd = [
+        "systemctl enable --now qemu-guest-agent || true",
+        "systemctl enable --now ssh || systemctl enable --now sshd || true",
+        *options.runcmd,
+    ]
+
+    user: dict[str, object] = {
+        "name": "boxer",
+        "groups": ["sudo"],
+        "shell": "/bin/bash",
+        "sudo": "ALL=(ALL) NOPASSWD:ALL",
+        "lock_passwd": True,
+    }
+    if options.ssh_authorized_keys:
+        user["ssh_authorized_keys"] = options.ssh_authorized_keys
+
+    data = {
+        "hostname": hostname,
+        "manage_etc_hosts": True,
+        "users": [user],
+        "package_update": True,
+        "packages": packages,
+        "runcmd": runcmd,
+    }
+    return "#cloud-config\n" + yaml.safe_dump(data, sort_keys=False)
 
 
 class CloudInitBuilder:
@@ -52,14 +73,25 @@ class CloudInitBuilder:
         dest_dir: Path,
         hostname: str,
         ssh_pubkey: Optional[str] = None,
+        ssh_authorized_keys: Optional[list[str]] = None,
+        packages: Optional[list[str]] = None,
+        runcmd: Optional[list[str]] = None,
     ) -> Path:
         iso_path = dest_dir / "cloud-init.iso"
         if iso_path.exists():
             return iso_path
 
-        user_data = _USER_DATA_TEMPLATE.format(
-            hostname=hostname,
-            ssh_keys_block=_ssh_keys_block(ssh_pubkey),
+        keys = []
+        if ssh_pubkey:
+            keys.append(ssh_pubkey)
+        keys.extend(ssh_authorized_keys or [])
+        user_data = _render_user_data(
+            hostname,
+            CloudInitOptions(
+                ssh_authorized_keys=_dedupe(keys),
+                packages=packages or [],
+                runcmd=runcmd or [],
+            ),
         )
         meta_data = _META_DATA_TEMPLATE.format(vm_id=vm_id, hostname=hostname)
 

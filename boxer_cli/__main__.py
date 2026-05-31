@@ -106,10 +106,57 @@ def stop(vm_id: str, force: bool) -> None:
 
 @cli.command("start")
 @click.argument("vm_id")
-def start(vm_id: str) -> None:
+@click.option("--wait-ip", "wait_for_ip_seconds", default=0, type=int,
+              help="Wait up to N seconds for guest-agent IP discovery")
+def start(vm_id: str, wait_for_ip_seconds: int) -> None:
     """Start a stopped VM."""
-    result = _run(_call("vm.start", {"vm_id": vm_id}))
-    click.echo(f"VM {result['vm_id']}: {result['state']}")
+    result = _run(_call("vm.start", {"vm_id": vm_id, "wait_for_ip_seconds": wait_for_ip_seconds}))
+    ip = result.get("ip_address") or "-"
+    click.echo(f"VM {result['vm_id']}: {result['state']}  ip={ip}")
+
+
+@cli.command("restart")
+@click.argument("vm_id")
+@click.option("--force", is_flag=True, help="Force power off before starting")
+@click.option("--wait-ip", "wait_for_ip_seconds", default=0, type=int,
+              help="Wait up to N seconds for guest-agent IP discovery")
+def restart(vm_id: str, force: bool, wait_for_ip_seconds: int) -> None:
+    """Restart a VM."""
+    result = _run(_call(
+        "vm.restart",
+        {
+            "vm_id": vm_id,
+            "graceful": not force,
+            "wait_for_ip_seconds": wait_for_ip_seconds,
+        },
+    ))
+    ip = result.get("ip_address") or "-"
+    click.echo(f"VM {result['vm_id']}: {result['state']}  ip={ip}")
+
+
+@cli.command("ssh-access")
+@click.argument("vm_id")
+@click.option("--show-private-key", is_flag=True, help="Print private key material")
+@click.option("--no-create", is_flag=True, help="Do not create a key if none exists")
+@click.option("--timeout", "timeout_seconds", default=30, show_default=True)
+def ssh_access(vm_id: str, show_private_key: bool, no_create: bool, timeout_seconds: int) -> None:
+    """Create or show direct SSH access details for a VM."""
+    result = _run(_call(
+        "vm.ssh_access",
+        {
+            "vm_id": vm_id,
+            "include_private_key": show_private_key,
+            "create": not no_create,
+            "timeout_seconds": timeout_seconds,
+        },
+    ))
+    click.echo(f"user: {result['username']}")
+    click.echo(f"host: {result.get('host') or '-'}")
+    click.echo(f"key:  {result['private_key_path']}")
+    click.echo(f"cmd:  {result['ssh_command']}")
+    if show_private_key:
+        click.echo("\nprivate_key:")
+        click.echo(result["private_key"])
 
 
 @cli.command("delete")

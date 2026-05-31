@@ -18,13 +18,19 @@ async def box_resource_status() -> dict[str, Any]:
 
 @mcp.tool()
 async def box_request_vm(
-    template: Annotated[str, "OS template name (e.g. ubuntu-24.04, debian-12, fedora-40)"],
+    template: Annotated[str, "OS template name (e.g. ubuntu-24.04, debian-12, fedora-44)"],
     purpose: Annotated[str, "Short name/purpose for the VM, used as hostname prefix"],
     headless: Annotated[bool, "True for no display (CLI-only), False for SPICE display"] = True,
     ttl_minutes: Annotated[int, "Lease duration in minutes before VM is marked stale"] = 60,
     cpu: Annotated[Optional[int], "Number of vCPUs (default from template)"] = None,
     ram_mb: Annotated[Optional[int], "RAM in MiB (default from template)"] = None,
     disk_gb: Annotated[Optional[int], "Disk size in GiB (default from template)"] = None,
+    bootstrap_packages: Annotated[Optional[list[str]], "Packages to install during first boot via cloud-init"] = None,
+    bootstrap_commands: Annotated[Optional[list[str]], "Shell commands to run during first boot via cloud-init"] = None,
+    ssh_public_keys: Annotated[Optional[list[str]], "Additional OpenSSH public keys to authorize for the boxer user"] = None,
+    ssh_access: Annotated[bool, "Generate and authorize a per-VM ephemeral SSH key"] = False,
+    return_ssh_private_key: Annotated[bool, "Include the generated private key in the response; only use when direct SSH is required"] = False,
+    wait_for_ip_seconds: Annotated[int, "Wait this many seconds for guest-agent IP discovery before returning"] = 0,
     tags: Annotated[Optional[dict[str, str]], "Optional key-value tags"] = None,
 ) -> dict[str, Any]:
     """Request a new VM. Returns vm_id when created, or queued status if host is at capacity."""
@@ -35,6 +41,18 @@ async def box_request_vm(
         params["ram_mb"] = ram_mb
     if disk_gb is not None:
         params["disk_gb"] = disk_gb
+    if bootstrap_packages:
+        params["bootstrap_packages"] = bootstrap_packages
+    if bootstrap_commands:
+        params["bootstrap_commands"] = bootstrap_commands
+    if ssh_public_keys:
+        params["ssh_public_keys"] = ssh_public_keys
+    if ssh_access:
+        params["ssh_access"] = ssh_access
+    if return_ssh_private_key:
+        params["return_ssh_private_key"] = return_ssh_private_key
+    if wait_for_ip_seconds:
+        params["wait_for_ip_seconds"] = wait_for_ip_seconds
     if tags:
         params["tags"] = tags
     return await ipc("vm.request", params)
@@ -59,9 +77,10 @@ async def box_get_vm(
 @mcp.tool()
 async def box_start_vm(
     vm_id: Annotated[str, "VM ID"],
+    wait_for_ip_seconds: Annotated[int, "Wait this many seconds for guest-agent IP discovery before returning"] = 0,
 ) -> dict[str, Any]:
     """Start a stopped VM."""
-    return await ipc("vm.start", {"vm_id": vm_id})
+    return await ipc("vm.start", {"vm_id": vm_id, "wait_for_ip_seconds": wait_for_ip_seconds})
 
 
 @mcp.tool()
@@ -71,6 +90,38 @@ async def box_stop_vm(
 ) -> dict[str, Any]:
     """Stop a running VM."""
     return await ipc("vm.stop", {"vm_id": vm_id, "graceful": graceful})
+
+
+@mcp.tool()
+async def box_restart_vm(
+    vm_id: Annotated[str, "VM ID"],
+    graceful: Annotated[bool, "True to request graceful shutdown before starting again"] = True,
+    wait_for_ip_seconds: Annotated[int, "Wait this many seconds for guest-agent IP discovery before returning"] = 0,
+) -> dict[str, Any]:
+    """Restart a VM and optionally wait for its IP address."""
+    return await ipc(
+        "vm.restart",
+        {"vm_id": vm_id, "graceful": graceful, "wait_for_ip_seconds": wait_for_ip_seconds},
+    )
+
+
+@mcp.tool()
+async def box_get_ssh_access(
+    vm_id: Annotated[str, "VM ID"],
+    include_private_key: Annotated[bool, "Include private key material in the response"] = False,
+    create: Annotated[bool, "Create and install an ephemeral key if one does not already exist"] = True,
+    timeout_seconds: Annotated[int, "Max time to install a new key through the daemon-owned SSH channel"] = 30,
+) -> dict[str, Any]:
+    """Return direct SSH access details for a VM. Private key material is returned only when explicitly requested."""
+    return await ipc(
+        "vm.ssh_access",
+        {
+            "vm_id": vm_id,
+            "include_private_key": include_private_key,
+            "create": create,
+            "timeout_seconds": timeout_seconds,
+        },
+    )
 
 
 @mcp.tool()
