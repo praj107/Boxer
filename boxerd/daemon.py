@@ -17,6 +17,7 @@ from boxerd.cloud_init import CloudInitBuilder
 from boxerd.db import Database
 from boxerd.guest_agent import GuestAgent
 from boxerd.image_catalog import ImageManager
+from boxerd.installer_seed import SUPPORTED_METHODS, InstallerSeedBuilder, SeedOptions
 from boxerd.ipc_server import IPCServer
 from boxerd.lease_manager import LeaseManager
 from boxerd.network_ops import NetworkManager
@@ -129,6 +130,7 @@ class BoxerDaemon:
         self._scheduler: Optional[Scheduler] = None
         self._lease_manager: Optional[LeaseManager] = None
         self._cloud_init = CloudInitBuilder()
+        self._installer_seed = InstallerSeedBuilder()
         self._ssh_keys = SSHKeyManager()
 
     async def start(self) -> None:
@@ -173,6 +175,7 @@ class BoxerDaemon:
     def _register_handlers(self) -> None:
         reg = self._server.register
         reg("vm.request", self._h_vm_request)
+        reg("vm.request_installer", self._h_vm_request_installer)
         reg("vm.list", self._h_vm_list)
         reg("vm.get", self._h_vm_get)
         reg("vm.start", self._h_vm_start)
@@ -258,7 +261,227 @@ class BoxerDaemon:
 
     async def _create_vm_from_request(self, request: dict[str, Any]) -> None:
         request = {**request, "return_ssh_private_key": False}
-        await self._h_vm_request(request)
+        if request.get("job_type") == "installer":
+            await self._h_vm_request_installer(request)
+        else:
+            await self._h_vm_request(request)
+
+    # ------------------------------------------------------------------ vm.request_installer
+
+    async def _h_vm_request_installer(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        template = params.get("template")
+        if not template:
+            raise IPCError(ERR_INVALID_PARAMS, "template is required for an ISO install")
+        purpose = params.get("purpose", "install")
+        ttl_minutes = int(params.get("ttl_minutes", max(self._cfg.default_ttl_minutes, 180)))
+        tags = params.get("tags") or {}
+        bootstrap = _bootstrap_from_params(params)
+
+        catalog_entry = self._image_manager._catalog.get(template)
+        if catalog_entry is None:
+            raise IPCError(ERR_INVALID_PARAMS, f"Unknown template: {template}")
+        if str(catalog_entry.get("type") or catalog_entry.get("artifact_type")) != "iso":
+            raise IPCError(
+                ERR_INVALID_PARAMS,
+                f"Template '{template}' is not an installer ISO. Use box_request_vm for cloud images.",
+            )
+
+        install_cfg = catalog_entry.get("install") or {}
+        method = str(install_cfg.get("method", "manual")).lower()
+        if method not in SUPPORTED_METHODS:
+            raise IPCError(
+                ERR_INVALID_PARAMS,
+                f"Template '{template}' has unsupported install method '{method}'. "
+                f"Supported: {sorted(SUPPORTED_METHODS)}",
+            )
+        # Manual installs must be headed so the console is reachable over SPICE.
+        headless = False if method == "manual" else bool(params.get("headless", False))
+
+        cpu = int(params.get("cpu") or catalog_entry.get("default_cpu", 2))
+        ram_mb = int(params.get("ram_mb") or catalog_entry.get("default_ram_mb", 2048))
+        disk_gb = int(params.get("disk_gb") or catalog_entry.get("default_disk_gb", 20))
+
+        # Installer-specific admission: its own concurrency cap plus host caps.
+        installing = await self._db.count_installing_vms()
+        if installing >= self._cfg.max_concurrent_installs:
+            reason = (
+                f"Installer concurrency limit reached "
+                f"({installing}/{self._cfg.max_concurrent_installs} installs running)"
+            )
+        else:
+            reason = await self._scheduler.check_admission(caller.project_id, cpu, ram_mb, disk_gb)
+        if reason:
+            queue_id = await self._scheduler.enqueue_request(
+                caller.project_id,
+                {
+                    **params,
+                    "job_type": "installer",
+                    "caller_project_id": caller.project_id,
+                    "caller_user": caller.user,
+                },
+                reason,
+            )
+            return {
+                "status": "queued",
+                "queue_id": queue_id,
+                "reason": reason,
+                "retry_after_seconds": 120,
+                "current_capacity": self._capacity.get_status(),
+            }
+
+        vm = await self._create_installer_vm(
+            caller_project_id=caller.project_id,
+            caller_user=caller.user,
+            template=template,
+            purpose=purpose,
+            method=method,
+            headless=headless,
+            ttl_minutes=ttl_minutes,
+            cpu=cpu,
+            ram_mb=ram_mb,
+            disk_gb=disk_gb,
+            tags=tags,
+            bootstrap=bootstrap,
+        )
+        result = _vm_to_dict(vm)
+        result["install_method"] = method
+        result["note"] = (
+            "Install in progress. Boxer will switch boot order to disk and start the VM "
+            "once the installer powers off. Poll box_get_vm for install_state."
+        )
+        return result
+
+    async def _create_installer_vm(
+        self,
+        *,
+        caller_project_id: str,
+        caller_user: str,
+        template: str,
+        purpose: str,
+        method: str,
+        headless: bool,
+        ttl_minutes: int,
+        cpu: int,
+        ram_mb: int,
+        disk_gb: int,
+        tags: dict[str, str],
+        bootstrap: dict[str, list[str]],
+    ) -> VMRecord:
+        vm_id = _make_vm_id()
+        libvirt_name = _make_libvirt_name(caller_project_id, purpose, vm_id)
+        now = datetime.now(timezone.utc)
+        lease_until = now + timedelta(minutes=ttl_minutes)
+
+        await self._db.upsert_project(caller_project_id, "unknown")
+
+        install_iso = await self._image_manager.ensure_iso(template)
+        vm_dir = self._storage.vm_dir(caller_project_id, vm_id)
+        disk_path = await self._storage.create_blank_disk(caller_project_id, vm_id, disk_gb)
+
+        ssh_keys = list(bootstrap["ssh_public_keys"])
+        if self._cfg.boxer_ssh_pubkey:
+            ssh_keys.insert(0, self._cfg.boxer_ssh_pubkey)
+        seed_iso = await self._installer_seed.build(
+            SeedOptions(
+                method=method,
+                hostname=purpose[:20] or "boxer",
+                ssh_authorized_keys=ssh_keys,
+                packages=bootstrap["packages"],
+            ),
+            vm_dir,
+        )
+
+        net_name = self._network.ensure_project_network(caller_project_id)
+        serial_log = vm_dir / "serial.log"
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: self._vm_ops.define_and_start_installer(
+                libvirt_name=libvirt_name,
+                vm_id=vm_id,
+                cpu=cpu,
+                ram_mb=ram_mb,
+                disk_path=disk_path,
+                install_iso=install_iso,
+                seed_iso=seed_iso,
+                net_name=net_name,
+                headless=headless,
+                serial_log=serial_log,
+            ),
+        )
+
+        vm = VMRecord(
+            id=vm_id,
+            libvirt_name=libvirt_name,
+            project_id=caller_project_id,
+            display_name=purpose,
+            state="running",
+            owner_user=caller_user,
+            template=template,
+            cpu=cpu,
+            ram_mb=ram_mb,
+            disk_gb=disk_gb,
+            headless=headless,
+            created_at=now,
+            last_touched=now,
+            lease_until=lease_until,
+            tags=tags,
+            artifact_type="iso",
+            install_state="installing",
+        )
+        await self._db.insert_vm(vm)
+        await self._db.add_event(
+            "INFO",
+            f"ISO install '{purpose}' ({vm_id}) started from {template} (method={method})",
+            project_id=caller_project_id,
+            vm_id=vm_id,
+        )
+        asyncio.create_task(self._watch_install(vm_id, libvirt_name))
+        return vm
+
+    async def _watch_install(
+        self, vm_id: str, libvirt_name: str, timeout_seconds: int = 7200
+    ) -> None:
+        """Wait for the installer to power off, then boot the installed disk.
+
+        The installer domain is defined with ``on_reboot=destroy``, so a normal
+        end-of-install reboot transitions the domain to ``stopped``. That edge is
+        the completion signal: we flip boot order to disk and start the VM.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        # Let the domain come up before we start watching for the power-off edge.
+        await asyncio.sleep(15)
+        try:
+            while loop.time() < deadline:
+                state = self._vm_ops.get_state(libvirt_name)
+                if state == "stopped":
+                    break
+                await asyncio.sleep(15)
+            else:
+                await self._db.update_vm_install_state(vm_id, "failed")
+                await self._db.add_event(
+                    "WARN",
+                    f"ISO install for {vm_id} did not finish within {timeout_seconds}s",
+                    vm_id=vm_id,
+                )
+                return
+
+            await loop.run_in_executor(None, self._vm_ops.switch_boot_to_disk, libvirt_name)
+            await loop.run_in_executor(None, self._vm_ops.start, libvirt_name)
+            await self._db.update_vm_install_state(vm_id, "installed")
+            await self._db.update_vm_state(vm_id, "running")
+            await self._db.add_event(
+                "INFO",
+                f"ISO install for {vm_id} completed; booted from disk",
+                vm_id=vm_id,
+            )
+            asyncio.create_task(self._poll_ip(vm_id, libvirt_name))
+        except Exception:
+            logger.exception("Install watcher failed for %s", vm_id)
+            await self._db.update_vm_install_state(vm_id, "failed")
 
     async def _create_vm(
         self,
@@ -969,4 +1192,6 @@ def _vm_to_dict(vm: VMRecord) -> dict[str, Any]:
         "lease_until": vm.lease_until.isoformat(),
         "tags": vm.tags,
         "origin": vm.origin,
+        "artifact_type": vm.artifact_type,
+        "install_state": vm.install_state,
     }

@@ -44,6 +44,26 @@ async def test_box_request_vm_passes_params() -> None:
 
 
 @pytest.mark.asyncio
+async def test_box_request_installer_passes_params() -> None:
+    with patch("boxer_mcp.tools.ipc", new_callable=AsyncMock) as mock_ipc:
+        mock_ipc.return_value = {"vm_id": "vm_iso01", "install_state": "installing"}
+        from boxer_mcp.tools import box_request_installer
+        result = await box_request_installer(
+            template="arch-latest",
+            purpose="arch-box",
+            disk_gb=40,
+            ssh_public_keys=["ssh-ed25519 AAAA boxer"],
+        )
+        assert mock_ipc.call_args[0][0] == "vm.request_installer"
+        params = mock_ipc.call_args[0][1]
+        assert params["template"] == "arch-latest"
+        assert params["purpose"] == "arch-box"
+        assert params["disk_gb"] == 40
+        assert params["ssh_public_keys"] == ["ssh-ed25519 AAAA boxer"]
+        assert result["install_state"] == "installing"
+
+
+@pytest.mark.asyncio
 async def test_box_delete_vm_requires_id() -> None:
     with patch("boxer_mcp.tools.ipc", new_callable=AsyncMock) as mock_ipc:
         mock_ipc.return_value = {"deleted": True}

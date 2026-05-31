@@ -87,11 +87,14 @@ def ls(stale: bool, show_all: bool, as_json: bool) -> None:
     click.echo("-" * 87)
     for v in vms:
         stale_s = _stale_flag(v)
+        install_s = ""
+        if v.get("install_state") in ("installing", "failed"):
+            install_s = f" [install:{v['install_state']}]"
         click.echo(
             f"{v['vm_id']:<14} {v['display_name']:<25} "
             f"{v.get('live_state', v['state']):<10} "
             f"{(v.get('ip_address') or '-'):<16} "
-            f"{_fmt_dt(v['lease_until'])}{stale_s}"
+            f"{_fmt_dt(v['lease_until'])}{stale_s}{install_s}"
         )
 
 

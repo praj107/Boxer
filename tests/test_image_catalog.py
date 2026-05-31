@@ -165,3 +165,36 @@ def _stub_download(payload: bytes):
     async def _dl(url: str) -> bytes:
         return payload
     return _dl
+
+
+# ----------------------------------------------------- ISO cache (Milestone 3)
+
+
+def test_ensure_image_rejects_iso_template(tmp_path) -> None:
+    import asyncio
+
+    entry = {"type": "iso", "url": "https://x/installer.iso", "sha256": None}
+    mgr = _manager(tmp_path, entry)
+    with pytest.raises(IPCError) as exc:
+        asyncio.run(mgr.ensure_image("test"))
+    assert exc.value.code == ERR_INVALID_PARAMS
+    assert "installer" in exc.value.message.lower()
+
+
+async def test_ensure_iso_rejects_cloud_image_template(tmp_path) -> None:
+    entry = {"type": "cloud-image", "url": "https://x/base.qcow2", "sha256": None}
+    mgr = _manager(tmp_path, entry)
+    with pytest.raises(IPCError) as exc:
+        await mgr.ensure_iso("test")
+    assert exc.value.code == ERR_INVALID_PARAMS
+
+
+def test_iso_and_image_caches_are_separate(tmp_path) -> None:
+    cfg = BoxerConfig({"state_dir": str(tmp_path)})
+    mgr = ImageManager(cfg, ImageCatalog({"images": {}}))
+    image_path = mgr._base_path("ubuntu", iso=False)
+    iso_path = mgr._base_path("arch", iso=True)
+    assert cfg.images_dir in image_path.parents
+    assert cfg.isos_dir in iso_path.parents
+    assert image_path.name == "base.qcow2"
+    assert iso_path.name == "installer.iso"

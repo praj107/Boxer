@@ -24,6 +24,8 @@ class VMRecord:
     ip_address: Optional[str] = None
     tags: dict[str, str] = field(default_factory=dict)
     origin: str = "boxer"  # 'boxer' | 'imported' | 'adopted'
+    artifact_type: str = "cloud-image"  # 'cloud-image' | 'iso'
+    install_state: Optional[str] = None  # None for cloud-images; 'installing'|'installed'|'failed' for ISO VMs
 
 
 @dataclass

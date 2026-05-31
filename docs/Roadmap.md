@@ -84,20 +84,40 @@ Notes / deferred within this milestone:
 
 ## Milestone 3: ISO Installer Workflow
 
+Status: implemented in this branch.
+
 Traditional installer ISOs need a separate flow from cloud images.
 
-Planned work:
+Scope:
 
-- Introduce an installer job type with its own queue and concurrency controls.
-- Create blank target disks instead of qcow2 overlays.
-- Boot ISO first, then switch boot order to disk after install.
-- Support unattended install methods where practical:
-  - Ubuntu autoinstall;
-  - Debian preseed or autoinstall-equivalent workflows;
-  - Fedora/RHEL-family Kickstart;
-  - Arch cloud-image preferred, manual ISO only for headed workflows.
-- Capture serial logs and installer state.
-- Keep ISO caches separate from cloud-image caches.
+- Installer job type (`vm.request_installer` / `box_request_installer`) with its
+  own concurrency cap (`max_concurrent_installs`); over-cap requests queue with
+  `job_type: installer` and are promoted by the existing queue runner.
+- Blank qcow2 target disks (`StorageManager.create_blank_disk`) instead of
+  backing-file overlays.
+- Installer domains boot the ISO first via per-device `<boot order>`; an install
+  watcher detects the end-of-install power-off (domains use `on_reboot=destroy`),
+  then rewrites the domain XML to boot from disk, detaches the cdrom, and starts
+  the VM. `install_state` (`installing`/`installed`/`failed`) is tracked in the DB.
+- Unattended seed generation (`boxerd/installer_seed.py`) for the methods named in
+  the catalog entry's `install.method`:
+  - `ubuntu`: cloud-init NoCloud autoinstall (`cidata`);
+  - `debian`: preseed (`PRESEED`);
+  - `fedora`/`rhel`: Kickstart on an `OEMDRV`-labelled seed ISO;
+  - `manual`: no seed, headed SPICE console (Arch uses this; its cloud-image is
+    preferred for headless automation).
+- Serial logs captured to `serial.log`; installer state exposed via `vm.get`,
+  `box_list_vms`, and `boxer ls`.
+- ISO cache (`isos_dir`) kept separate from the cloud-image cache (`images_dir`),
+  reusing the Milestone 2 checksum-manifest + PGP verification chain.
+
+Notes / deferred within this milestone:
+
+- Fully hands-off kernel-cmdline injection (e.g. Ubuntu `autoinstall ds=nocloud`)
+  is not performed; seeds are placed on auto-detected volume labels and the headed
+  console remains the fallback for installers that need a boot argument.
+- Arch ISO-level signature enforcement is still tracked alongside its `.sig` flow,
+  not the checksum-manifest path.
 
 ## Milestone 4: Image Families and Refresh Policy
 

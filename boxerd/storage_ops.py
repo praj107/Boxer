@@ -72,6 +72,27 @@ class StorageManager:
             capture_output=True,
         )
 
+    async def create_blank_disk(self, project_id: str, vm_id: str, disk_gb: int) -> Path:
+        """Create an empty qcow2 target disk (no backing file) for an ISO install."""
+        vm_dir = self.vm_dir(project_id, vm_id)
+        vm_dir.mkdir(parents=True, exist_ok=True)
+        disk = vm_dir / "disk.qcow2"
+        if disk.exists():
+            return disk
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._create_blank_sync, str(disk), disk_gb)
+        logger.info("Created blank install disk %s (size=%dG)", disk, disk_gb)
+        return disk
+
+    @staticmethod
+    def _create_blank_sync(dest: str, size_gb: int) -> None:
+        subprocess.run(
+            ["qemu-img", "create", "-f", "qcow2", dest, f"{size_gb}G"],
+            check=True,
+            capture_output=True,
+        )
+
     def delete_vm_storage(self, project_id: str, vm_id: str) -> None:
         import shutil
         vm_dir = self.vm_dir(project_id, vm_id)

@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS vms (
     created_at   TEXT NOT NULL,
     last_touched TEXT NOT NULL,
     lease_until  TEXT NOT NULL,
+    artifact_type TEXT NOT NULL DEFAULT 'cloud-image',
+    install_state TEXT,
     FOREIGN KEY (project_id) REFERENCES projects(id)
 );
 
@@ -102,6 +104,8 @@ def _vm_from_row(row: aiosqlite.Row, tags: dict[str, str]) -> VMRecord:
         lease_until=_parse_dt(row["lease_until"]),
         tags=tags,
         origin=row["origin"] if "origin" in row.keys() else "boxer",
+        artifact_type=row["artifact_type"] if "artifact_type" in row.keys() else "cloud-image",
+        install_state=row["install_state"] if "install_state" in row.keys() else None,
     )
 
 
@@ -116,14 +120,17 @@ class Database:
         self._db.row_factory = aiosqlite.Row
         await self._db.executescript(_SCHEMA)
         await self._db.commit()
-        # Idempotent migration: add 'origin' column for existing DBs
-        try:
-            await self._db.execute(
-                "ALTER TABLE vms ADD COLUMN origin TEXT NOT NULL DEFAULT 'boxer'"
-            )
-            await self._db.commit()
-        except Exception:
-            pass  # Column already exists
+        # Idempotent migrations: add columns for existing DBs.
+        for ddl in (
+            "ALTER TABLE vms ADD COLUMN origin TEXT NOT NULL DEFAULT 'boxer'",
+            "ALTER TABLE vms ADD COLUMN artifact_type TEXT NOT NULL DEFAULT 'cloud-image'",
+            "ALTER TABLE vms ADD COLUMN install_state TEXT",
+        ):
+            try:
+                await self._db.execute(ddl)
+                await self._db.commit()
+            except Exception:
+                pass  # Column already exists
 
     async def close(self) -> None:
         if self._db:
@@ -153,14 +160,15 @@ class Database:
             await db.execute(
                 """INSERT INTO vms(id,libvirt_name,project_id,display_name,state,owner_user,
                    template,cpu,ram_mb,disk_gb,headless,ip_address,created_at,last_touched,
-                   lease_until,origin)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   lease_until,origin,artifact_type,install_state)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     vm.id, vm.libvirt_name, vm.project_id, vm.display_name, vm.state,
                     vm.owner_user, vm.template, vm.cpu, vm.ram_mb, vm.disk_gb,
                     int(vm.headless), vm.ip_address,
                     vm.created_at.isoformat(), vm.last_touched.isoformat(),
                     vm.lease_until.isoformat(), vm.origin,
+                    vm.artifact_type, vm.install_state,
                 ),
             )
             for k, v in vm.tags.items():
@@ -216,6 +224,23 @@ class Database:
                 (lease_until.isoformat(), _now(), vm_id),
             )
             await db.commit()
+
+    async def update_vm_install_state(self, vm_id: str, install_state: Optional[str]) -> None:
+        async with self._conn() as db:
+            await db.execute(
+                "UPDATE vms SET install_state=?, last_touched=? WHERE id=?",
+                (install_state, _now(), vm_id),
+            )
+            await db.commit()
+
+    async def count_installing_vms(self) -> int:
+        """Count VMs across all projects whose ISO install is still in progress."""
+        async with self._conn() as db:
+            async with db.execute(
+                "SELECT COUNT(*) AS n FROM vms WHERE install_state='installing'"
+            ) as cur:
+                row = await cur.fetchone()
+        return int(row["n"]) if row else 0
 
     async def touch_vm(self, vm_id: str) -> None:
         async with self._conn() as db:

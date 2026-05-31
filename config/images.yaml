@@ -99,9 +99,37 @@ images:
     description: "Arch Linux (latest ISO)"
     url: "https://geo.mirror.pkgbuild.com/iso/latest/archlinux-x86_64.iso"
     sha256: null
+    # Arch has no unattended cloud-installer; drive the live ISO interactively
+    # over SPICE. Arch's cloud-image is preferred for headless automation.
     # Arch signs the ISO itself (archlinux-x86_64.iso.sig) rather than a checksum
-    # manifest. ISO installer fetching is deferred to Milestone 3; signature
-    # enforcement for the ISO is wired up alongside that workflow.
+    # manifest; ISO signature enforcement is tracked separately from this entry.
+    install:
+      method: manual
     default_cpu: 2
     default_ram_mb: 2048
     default_disk_gb: 30
+
+  # Example unattended-install entry (admin-provided). Installer ISO URLs and
+  # their SHA256SUMS/SHA256SUMS.gpg live on releases.ubuntu.com and are
+  # point-release specific, so this is left commented for admins to pin:
+  #
+  # ubuntu-24.04-installer:
+  #   type: iso
+  #   description: "Ubuntu 24.04 live-server (autoinstall)"
+  #   url: "https://releases.ubuntu.com/24.04/ubuntu-24.04.X-live-server-amd64.iso"
+  #   sha256: null
+  #   verification:
+  #     mode: checksum-manifest
+  #     checksum_url: "https://releases.ubuntu.com/24.04/SHA256SUMS"
+  #     checksum_algorithm: sha256
+  #     checksum_filename: "ubuntu-24.04.X-live-server-amd64.iso"
+  #     signature:
+  #       mode: detached
+  #       signature_url: "https://releases.ubuntu.com/24.04/SHA256SUMS.gpg"
+  #       keyring: "ubuntu-cloudimage-keyring.gpg"
+  #       required: false
+  #   install:
+  #     method: ubuntu     # manual | ubuntu | debian | fedora | rhel
+  #   default_cpu: 2
+  #   default_ram_mb: 4096
+  #   default_disk_gb: 25

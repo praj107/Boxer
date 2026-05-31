@@ -97,6 +97,33 @@ async def test_queue_operations(db: Database) -> None:
 
 
 @pytest.mark.asyncio
+async def test_install_state_roundtrip_and_count(db: Database) -> None:
+    await db.upsert_project("p_aaa111", "/a")
+    vm = _make_vm("vm_iso01", "p_aaa111")
+    vm.artifact_type = "iso"
+    vm.install_state = "installing"
+    await db.insert_vm(vm)
+
+    fetched = await db.get_vm("vm_iso01")
+    assert fetched.artifact_type == "iso"
+    assert fetched.install_state == "installing"
+    assert await db.count_installing_vms() == 1
+
+    await db.update_vm_install_state("vm_iso01", "installed")
+    assert (await db.get_vm("vm_iso01")).install_state == "installed"
+    assert await db.count_installing_vms() == 0
+
+
+@pytest.mark.asyncio
+async def test_cloud_image_vm_has_no_install_state(db: Database) -> None:
+    await db.upsert_project("p_aaa111", "/a")
+    await db.insert_vm(_make_vm("vm_cloud1", "p_aaa111"))
+    fetched = await db.get_vm("vm_cloud1")
+    assert fetched.artifact_type == "cloud-image"
+    assert fetched.install_state is None
+
+
+@pytest.mark.asyncio
 async def test_events(db: Database) -> None:
     evt = await db.add_event("INFO", "VM created", project_id="p_aaa111", vm_id="vm_abc")
     assert evt.level == "INFO"

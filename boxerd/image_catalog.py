@@ -158,46 +158,72 @@ class ImageManager:
         self._catalog = catalog or get_catalog()
         self._keyrings_dir = self._cfg.keyrings_dir
 
-    def _base_path(self, name: str) -> Path:
-        return self._cfg.images_dir / name / "base.qcow2"
+    def _cache_dir(self, name: str, *, iso: bool = False) -> Path:
+        root = self._cfg.isos_dir if iso else self._cfg.images_dir
+        return root / name
 
-    def _checksum_path(self, name: str) -> Path:
-        return self._cfg.images_dir / name / "checksum.txt"
+    def _base_path(self, name: str, *, iso: bool = False) -> Path:
+        return self._cache_dir(name, iso=iso) / ("installer.iso" if iso else "base.qcow2")
 
-    def _metadata_path(self, name: str) -> Path:
-        return self._cfg.images_dir / name / "metadata.json"
+    def _checksum_path(self, name: str, *, iso: bool = False) -> Path:
+        return self._cache_dir(name, iso=iso) / "checksum.txt"
 
-    def is_cached(self, name: str) -> bool:
-        p = self._base_path(name)
-        return p.exists() and self._checksum_path(name).exists()
+    def _metadata_path(self, name: str, *, iso: bool = False) -> Path:
+        return self._cache_dir(name, iso=iso) / "metadata.json"
+
+    def is_cached(self, name: str, *, iso: bool = False) -> bool:
+        p = self._base_path(name, iso=iso)
+        return p.exists() and self._checksum_path(name, iso=iso).exists()
 
     async def ensure_image(self, name: str) -> Path:
-        entry = self._catalog.get(name)
-        if entry is None:
-            raise IPCError(ERR_INVALID_PARAMS, f"Unknown template: {name}. Available: {self._catalog.list_names()}")
-
+        """Fetch and verify a cloud-image base disk. Rejects installer ISO templates."""
+        entry = self._require_entry(name)
         artifact_type = _artifact_type(entry)
         if artifact_type != "cloud-image":
             raise IPCError(
                 ERR_INVALID_PARAMS,
-                f"Template '{name}' is type '{artifact_type}'. Boxer VM creation currently supports cloud-image templates only; installer ISO support is on the roadmap.",
+                f"Template '{name}' is type '{artifact_type}'. Use the ISO installer workflow "
+                "(vm.request_installer / box_request_installer) for installer ISO templates.",
             )
+        return await self._ensure_artifact(name, entry, iso=False)
 
-        base_path = self._base_path(name)
+    async def ensure_iso(self, name: str) -> Path:
+        """Fetch and verify an installer ISO into the ISO cache (separate from images)."""
+        entry = self._require_entry(name)
+        artifact_type = _artifact_type(entry)
+        if artifact_type != "iso":
+            raise IPCError(
+                ERR_INVALID_PARAMS,
+                f"Template '{name}' is type '{artifact_type}', not an installer ISO.",
+            )
+        return await self._ensure_artifact(name, entry, iso=True)
+
+    def _require_entry(self, name: str) -> dict:
+        entry = self._catalog.get(name)
+        if entry is None:
+            raise IPCError(
+                ERR_INVALID_PARAMS,
+                f"Unknown template: {name}. Available: {self._catalog.list_names()}",
+            )
+        return entry
+
+    async def _ensure_artifact(self, name: str, entry: dict, *, iso: bool) -> Path:
+        kind = "ISO" if iso else "image"
+        base_path = self._base_path(name, iso=iso)
         url = entry["url"]
         _validate_url(url)
         expected = await self._expected_digest(entry, url)
 
-        cached = self._read_cached_digest(name)
-        if self.is_cached(name) and self._cache_matches_expected(cached, expected):
-            logger.debug("Image %s already cached at %s", name, base_path)
+        cached = self._read_cached_digest(name, iso=iso)
+        if self.is_cached(name, iso=iso) and self._cache_matches_expected(cached, expected):
+            logger.debug("%s %s already cached at %s", kind, name, base_path)
             return base_path
-        if self.is_cached(name) and expected is not None:
-            logger.info("Cached image %s no longer matches expected digest; refreshing", name)
+        if self.is_cached(name, iso=iso) and expected is not None:
+            logger.info("Cached %s %s no longer matches expected digest; refreshing", kind, name)
             base_path.unlink(missing_ok=True)
-            self._checksum_path(name).unlink(missing_ok=True)
+            self._checksum_path(name, iso=iso).unlink(missing_ok=True)
 
-        logger.info("Fetching image %s from %s", name, url)
+        logger.info("Fetching %s %s from %s", kind, name, url)
         base_path.parent.mkdir(parents=True, exist_ok=True)
 
         tmp_path = Path(tempfile.mktemp(dir=base_path.parent, suffix=".tmp"))
@@ -213,8 +239,8 @@ class ImageManager:
                 )
 
             tmp_path.rename(base_path)
-            self._write_cache_metadata(name, url, algorithm, actual_digest, expected)
-            logger.info("Image %s cached, %s=%s", name, algorithm, actual_digest)
+            self._write_cache_metadata(name, url, algorithm, actual_digest, expected, iso=iso)
+            logger.info("%s %s cached, %s=%s", kind, name, algorithm, actual_digest)
             return base_path
         except Exception:
             if tmp_path.exists():
@@ -353,8 +379,8 @@ class ImageManager:
         signer = result.fingerprints[0] if result.fingerprints else "verified"
         return f"pgp signature verified via {keyring.name} (key {signer})"
 
-    def _read_cached_digest(self, name: str) -> Optional[ExpectedDigest]:
-        path = self._checksum_path(name)
+    def _read_cached_digest(self, name: str, *, iso: bool = False) -> Optional[ExpectedDigest]:
+        path = self._checksum_path(name, iso=iso)
         if not path.exists():
             return None
         raw = path.read_text().strip()
@@ -383,10 +409,13 @@ class ImageManager:
         algorithm: str,
         digest: str,
         expected: Optional[ExpectedDigest],
+        *,
+        iso: bool = False,
     ) -> None:
-        self._checksum_path(name).write_text(f"{algorithm}:{digest}\n")
+        self._checksum_path(name, iso=iso).write_text(f"{algorithm}:{digest}\n")
         metadata = {
             "template": name,
+            "artifact_type": "iso" if iso else "cloud-image",
             "url": url,
             "algorithm": algorithm,
             "digest": digest,
@@ -395,7 +424,7 @@ class ImageManager:
             "signature_verified": bool(expected and expected.signature),
             "signature_provenance": expected.signature if expected else None,
         }
-        self._metadata_path(name).write_text(json.dumps(metadata, indent=2) + "\n")
+        self._metadata_path(name, iso=iso).write_text(json.dumps(metadata, indent=2) + "\n")
 
     async def _download(self, url: str, dest: Path) -> None:
         async with httpx.AsyncClient(follow_redirects=False, timeout=3600) as client:

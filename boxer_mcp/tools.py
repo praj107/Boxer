@@ -59,6 +59,48 @@ async def box_request_vm(
 
 
 @mcp.tool()
+async def box_request_installer(
+    template: Annotated[str, "Installer ISO template name (type: iso in the catalog, e.g. arch-latest)"],
+    purpose: Annotated[str, "Short name/purpose for the VM, used as hostname prefix"],
+    headless: Annotated[bool, "True for no display; only valid for unattended install methods (autoinstall/preseed/kickstart)"] = False,
+    ttl_minutes: Annotated[int, "Lease duration in minutes (installs default to a longer lease)"] = 180,
+    cpu: Annotated[Optional[int], "Number of vCPUs (default from template)"] = None,
+    ram_mb: Annotated[Optional[int], "RAM in MiB (default from template)"] = None,
+    disk_gb: Annotated[Optional[int], "Blank target disk size in GiB (default from template)"] = None,
+    bootstrap_packages: Annotated[Optional[list[str]], "Extra packages to include in the unattended install seed"] = None,
+    ssh_public_keys: Annotated[Optional[list[str]], "OpenSSH public keys to authorize for the installed user"] = None,
+    tags: Annotated[Optional[dict[str, str]], "Optional key-value tags"] = None,
+) -> dict[str, Any]:
+    """Provision a VM from an installer ISO (blank disk, ISO booted first).
+
+    The catalog entry's install method (manual/ubuntu/debian/fedora) decides
+    whether an unattended seed is generated. Boxer boots the ISO, and once the
+    installer powers off it switches boot order to the installed disk and starts
+    the VM. Returns vm_id immediately with install_state=installing, or queued
+    status if the installer concurrency limit is reached. Poll box_get_vm.
+    """
+    params: dict[str, Any] = {
+        "template": template,
+        "purpose": purpose,
+        "headless": headless,
+        "ttl_minutes": ttl_minutes,
+    }
+    if cpu is not None:
+        params["cpu"] = cpu
+    if ram_mb is not None:
+        params["ram_mb"] = ram_mb
+    if disk_gb is not None:
+        params["disk_gb"] = disk_gb
+    if bootstrap_packages:
+        params["bootstrap_packages"] = bootstrap_packages
+    if ssh_public_keys:
+        params["ssh_public_keys"] = ssh_public_keys
+    if tags:
+        params["tags"] = tags
+    return await ipc("vm.request_installer", params)
+
+
+@mcp.tool()
 async def box_list_vms(
     include_stale: Annotated[bool, "Include stopped VMs with expired leases"] = False,
 ) -> list[dict[str, Any]]:
