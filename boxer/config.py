@@ -147,6 +147,23 @@ class BoxerConfig:
     def admin_group(self) -> str:
         return self._d.get("admin_group", "boxer-admin")
 
+    # Local ISO support
+    @property
+    def local_iso_dir(self) -> Optional[Path]:
+        """Directory from which local ISO files may be read via iso_path in box_request_installer.
+
+        None (default) permits any accessible absolute ISO path, which is suitable
+        for a single-developer workstation. Set this to a directory that contains
+        custom-built ISOs to restrict iso_path to that subtree on shared hosts.
+        """
+        p = self._d.get("local_iso_dir")
+        return Path(p).expanduser() if p else None
+
+    @property
+    def qemu_group(self) -> str:
+        """Host group used by QEMU processes for VM disk/ISO access."""
+        return self._d.get("qemu_group", "kvm")
+
 
 class ImageCatalog:
     def __init__(self, data: dict[str, Any]):

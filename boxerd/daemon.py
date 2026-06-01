@@ -6,6 +6,7 @@ import logging
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 import libvirt
@@ -134,6 +135,42 @@ def _bootstrap_from_params(params: dict[str, Any]) -> dict[str, list[str]]:
         "secret_count": secret_count,
         "profiles": profile_names,
     }
+
+
+def _validate_local_iso_path(path_str: str, local_iso_dir) -> "Path":
+    """Validate a caller-supplied local ISO path and return its resolved real path.
+
+    When local_iso_dir is set, the path must resolve under that directory (prevents
+    an agent from booting files outside the designated staging area on shared hosts).
+    When local_iso_dir is None (the default), any accessible ISO path is permitted —
+    appropriate for a single-developer workstation where all IPC callers are trusted.
+    """
+    if not path_str.startswith("/"):
+        raise IPCError(ERR_INVALID_PARAMS, "iso_path must be an absolute path")
+    path = Path(path_str)
+    if not path.exists():
+        raise IPCError(ERR_INVALID_PARAMS, f"iso_path does not exist: {path}")
+    if not path.is_file():
+        raise IPCError(ERR_INVALID_PARAMS, f"iso_path is not a regular file: {path}")
+    real = path.resolve()
+    if local_iso_dir is not None:
+        real_dir = local_iso_dir.resolve()
+        try:
+            real.relative_to(real_dir)
+        except ValueError:
+            raise IPCError(
+                ERR_INVALID_PARAMS,
+                f"iso_path must be under local_iso_dir ({local_iso_dir}). "
+                f"Resolved path: {real}",
+            )
+    return real
+
+
+def _caller_project_path(params: dict[str, Any], project_id: str) -> str:
+    path = params.get("caller_project_path")
+    if isinstance(path, str) and path.strip():
+        return str(Path(path).expanduser().resolve())
+    return f"unknown:{project_id}"
 
 
 def _dedupe_keep_order(items: list[str]) -> list[str]:
@@ -302,6 +339,7 @@ class BoxerDaemon:
         reg("vm.exec", self._h_vm_exec)
         reg("vm.screenshot", self._h_vm_screenshot)
         reg("vm.input", self._h_vm_input)
+        reg("vm.serial_log", self._h_vm_serial_log)
         reg("image.preflight", self._h_image_preflight)
         reg("profile.list", self._h_profile_list)
         reg("image.list", self._h_image_list)
@@ -323,6 +361,7 @@ class BoxerDaemon:
 
     async def _h_vm_request(self, params: dict[str, Any]) -> dict[str, Any]:
         caller = caller_from_params(params)
+        caller_project_path = _caller_project_path(params, caller.project_id)
         template = params.get("template", "ubuntu-24.04")
         purpose = params.get("purpose", "vm")
         headless = bool(params.get("headless", True))
@@ -343,7 +382,20 @@ class BoxerDaemon:
 
         catalog_entry = self._image_manager._catalog.get(template)
         if catalog_entry is None:
-            raise IPCError(ERR_INVALID_PARAMS, f"Unknown template: {template}")
+            # Give a targeted hint when the caller passes a local file path.
+            if template.startswith("/") and template.lower().endswith(".iso"):
+                raise IPCError(
+                    ERR_INVALID_PARAMS,
+                    f"'{template}' looks like a local ISO file path, not a catalog template. "
+                    "To boot a custom ISO use box_request_installer with the iso_path parameter: "
+                    f"box_request_installer(iso_path='{template}', purpose='<name>'). "
+                    "box_request_vm only accepts cloud-image catalog names (e.g. ubuntu-24.04).",
+                )
+            raise IPCError(
+                ERR_INVALID_PARAMS,
+                f"Unknown template: {template}. "
+                f"Available: {self._image_manager._catalog.list_names()}",
+            )
 
         cpu = int(params.get("cpu") or catalog_entry.get("default_cpu", 2))
         ram_mb = int(params.get("ram_mb") or catalog_entry.get("default_ram_mb", 2048))
@@ -367,6 +419,7 @@ class BoxerDaemon:
 
         vm, ssh_access_info = await self._create_vm(
             caller_project_id=caller.project_id,
+            caller_project_path=caller_project_path,
             caller_user=caller.user,
             template=template,
             purpose=purpose,
@@ -441,7 +494,7 @@ class BoxerDaemon:
         return report
 
     async def _create_vm_from_request(self, request: dict[str, Any]) -> None:
-        request = {**request, "return_ssh_private_key": False}
+        request = {**request, "return_ssh_private_key": False, "wait_install_seconds": 0}
         if request.get("job_type") == "installer":
             await self._h_vm_request_installer(request)
         else:
@@ -451,37 +504,66 @@ class BoxerDaemon:
 
     async def _h_vm_request_installer(self, params: dict[str, Any]) -> dict[str, Any]:
         caller = caller_from_params(params)
+        caller_project_path = _caller_project_path(params, caller.project_id)
         template = params.get("template")
-        if not template:
-            raise IPCError(ERR_INVALID_PARAMS, "template is required for an ISO install")
+        iso_path_str = params.get("iso_path")
+        wait_install_seconds = max(0, min(int(params.get("wait_install_seconds", 0) or 0), 1800))
+
+        if not template and not iso_path_str:
+            raise IPCError(ERR_INVALID_PARAMS, "Either template or iso_path is required for an ISO install")
+        if template and iso_path_str:
+            raise IPCError(ERR_INVALID_PARAMS, "template and iso_path are mutually exclusive")
+
         purpose = params.get("purpose", "install")
         ttl_minutes = int(params.get("ttl_minutes", max(self._cfg.default_ttl_minutes, 180)))
         tags = params.get("tags") or {}
         bootstrap = _bootstrap_from_params(params)
 
-        catalog_entry = self._image_manager._catalog.get(template)
-        if catalog_entry is None:
-            raise IPCError(ERR_INVALID_PARAMS, f"Unknown template: {template}")
-        if str(catalog_entry.get("type") or catalog_entry.get("artifact_type")) != "iso":
-            raise IPCError(
-                ERR_INVALID_PARAMS,
-                f"Template '{template}' is not an installer ISO. Use box_request_vm for cloud images.",
-            )
+        if iso_path_str:
+            # Local ISO path: validate and use directly, no catalog lookup.
+            install_iso = _validate_local_iso_path(iso_path_str, self._cfg.local_iso_dir)
+            method = str(params.get("install_method", "manual")).lower()
+            if method not in SUPPORTED_METHODS:
+                raise IPCError(
+                    ERR_INVALID_PARAMS,
+                    f"Unsupported install_method '{method}'. Supported: {sorted(SUPPORTED_METHODS)}",
+                )
+            # Local ISOs default headless=True so serial log is the primary interface.
+            headless = bool(params.get("headless", True))
+            display_template = f"local:{Path(iso_path_str).name}"
+            cpu = int(params.get("cpu") or 2)
+            ram_mb = int(params.get("ram_mb") or 2048)
+            disk_gb = int(params.get("disk_gb") or 20)
+            # manual method + local ISO = test-boot mode: no install expected, no watcher.
+            test_boot = (method == "manual")
+            stage_install_iso = True
+        else:
+            catalog_entry = self._image_manager._catalog.get(template)
+            if catalog_entry is None:
+                raise IPCError(ERR_INVALID_PARAMS, f"Unknown template: {template}")
+            if str(catalog_entry.get("type") or catalog_entry.get("artifact_type")) != "iso":
+                raise IPCError(
+                    ERR_INVALID_PARAMS,
+                    f"Template '{template}' is not an installer ISO. Use box_request_vm for cloud images.",
+                )
 
-        install_cfg = catalog_entry.get("install") or {}
-        method = str(install_cfg.get("method", "manual")).lower()
-        if method not in SUPPORTED_METHODS:
-            raise IPCError(
-                ERR_INVALID_PARAMS,
-                f"Template '{template}' has unsupported install method '{method}'. "
-                f"Supported: {sorted(SUPPORTED_METHODS)}",
-            )
-        # Manual installs must be headed so the console is reachable over SPICE.
-        headless = False if method == "manual" else bool(params.get("headless", False))
-
-        cpu = int(params.get("cpu") or catalog_entry.get("default_cpu", 2))
-        ram_mb = int(params.get("ram_mb") or catalog_entry.get("default_ram_mb", 2048))
-        disk_gb = int(params.get("disk_gb") or catalog_entry.get("default_disk_gb", 20))
+            install_cfg = catalog_entry.get("install") or {}
+            method = str(install_cfg.get("method", "manual")).lower()
+            if method not in SUPPORTED_METHODS:
+                raise IPCError(
+                    ERR_INVALID_PARAMS,
+                    f"Template '{template}' has unsupported install method '{method}'. "
+                    f"Supported: {sorted(SUPPORTED_METHODS)}",
+                )
+            # Manual installs must be headed so the console is reachable over SPICE.
+            headless = False if method == "manual" else bool(params.get("headless", False))
+            display_template = template
+            cpu = int(params.get("cpu") or catalog_entry.get("default_cpu", 2))
+            ram_mb = int(params.get("ram_mb") or catalog_entry.get("default_ram_mb", 2048))
+            disk_gb = int(params.get("disk_gb") or catalog_entry.get("default_disk_gb", 20))
+            install_iso = await self._image_manager.ensure_iso(template)
+            test_boot = False  # catalog ISOs always go through the install watcher
+            stage_install_iso = False
 
         # Installer-specific admission: its own concurrency cap plus host caps.
         installing = await self._db.count_installing_vms()
@@ -513,9 +595,11 @@ class BoxerDaemon:
 
         vm = await self._create_installer_vm(
             caller_project_id=caller.project_id,
+            caller_project_path=caller_project_path,
             caller_user=caller.user,
-            template=template,
+            template=display_template,
             purpose=purpose,
+            install_iso=install_iso,
             method=method,
             headless=headless,
             ttl_minutes=ttl_minutes,
@@ -524,22 +608,47 @@ class BoxerDaemon:
             disk_gb=disk_gb,
             tags=tags,
             bootstrap=bootstrap,
+            test_boot=test_boot,
+            stage_install_iso=stage_install_iso,
         )
         result = _vm_to_dict(vm)
         result["install_method"] = method
-        result["note"] = (
-            "Install in progress. Boxer will switch boot order to disk and start the VM "
-            "once the installer powers off. Poll box_get_vm for install_state."
-        )
+
+        if test_boot:
+            result["note"] = (
+                "VM is booting from the local ISO. No install watcher — the VM runs "
+                "until you stop or delete it. The blank target disk is exposed as NVMe. "
+                "Use box_get_serial_log to read console output."
+            )
+        elif wait_install_seconds > 0:
+            final_state = await self._wait_for_install(vm.id, wait_install_seconds)
+            result["install_state"] = final_state
+            if final_state == "installed":
+                result["note"] = "Install completed. VM is now running from disk."
+            elif final_state == "failed":
+                result["note"] = "Install failed. Use box_get_serial_log to inspect the console output."
+            else:
+                result["note"] = (
+                    f"Wait timeout ({wait_install_seconds}s) reached before install finished. "
+                    "Poll box_get_vm for install_state or box_get_serial_log for progress."
+                )
+        else:
+            result["note"] = (
+                "Install in progress. Boxer will switch boot order to disk and start the VM "
+                "once the installer powers off. Poll box_get_vm for install_state, or "
+                "use box_get_serial_log to monitor console output."
+            )
         return result
 
     async def _create_installer_vm(
         self,
         *,
         caller_project_id: str,
+        caller_project_path: str,
         caller_user: str,
         template: str,
         purpose: str,
+        install_iso: Path,
         method: str,
         headless: bool,
         ttl_minutes: int,
@@ -548,17 +657,35 @@ class BoxerDaemon:
         disk_gb: int,
         tags: dict[str, str],
         bootstrap: dict[str, list[str]],
+        test_boot: bool = False,
+        stage_install_iso: bool = False,
     ) -> VMRecord:
+        """Provision an installer or test-boot VM from an ISO.
+
+        test_boot=True (local ISO + manual method): VM boots the ISO and runs
+        indefinitely; no install watcher, on_reboot=restart, install_state=None.
+        Appropriate for OS development test cycles where serial output is the
+        acceptance criterion, not a successful install to disk.
+        """
         vm_id = _make_vm_id()
         libvirt_name = _make_libvirt_name(caller_project_id, purpose, vm_id)
         now = datetime.now(timezone.utc)
         lease_until = now + timedelta(minutes=ttl_minutes)
 
-        await self._db.upsert_project(caller_project_id, "unknown")
+        await self._db.upsert_project(caller_project_id, caller_project_path)
 
-        install_iso = await self._image_manager.ensure_iso(template)
         vm_dir = self._storage.vm_dir(caller_project_id, vm_id)
-        disk_path = await self._storage.create_blank_disk(caller_project_id, vm_id, disk_gb)
+        disk_format = "raw" if test_boot else "qcow2"
+        disk_path = await self._storage.create_blank_disk(
+            caller_project_id,
+            vm_id,
+            disk_gb,
+            disk_format=disk_format,
+        )
+        if stage_install_iso:
+            install_iso = await self._storage.stage_iso(caller_project_id, vm_id, install_iso)
+        else:
+            self._storage.prepare_readonly_file(install_iso)
 
         ssh_keys = list(bootstrap["ssh_public_keys"])
         if self._cfg.boxer_ssh_pubkey:
@@ -572,26 +699,40 @@ class BoxerDaemon:
             ),
             vm_dir,
         )
+        self._storage.prepare_readonly_file(seed_iso)
 
         net_name = self._network.ensure_project_network(caller_project_id)
         serial_log = vm_dir / "serial.log"
+        self._storage.prepare_mutable_file(serial_log, create=True)
+
+        # test_boot: allow reboots (on_reboot=restart) instead of destroying the domain.
+        # Installer flows use on_reboot=destroy so the end-of-install reboot is the
+        # completion signal; test boots should survive reboots for iterative development.
+        reboot_policy = "restart" if test_boot else "destroy"
 
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: self._vm_ops.define_and_start_installer(
-                libvirt_name=libvirt_name,
-                vm_id=vm_id,
-                cpu=cpu,
-                ram_mb=ram_mb,
-                disk_path=disk_path,
-                install_iso=install_iso,
-                seed_iso=seed_iso,
-                net_name=net_name,
-                headless=headless,
-                serial_log=serial_log,
-            ),
-        )
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: self._vm_ops.define_and_start_installer(
+                    libvirt_name=libvirt_name,
+                    vm_id=vm_id,
+                    cpu=cpu,
+                    ram_mb=ram_mb,
+                    disk_path=disk_path,
+                    install_iso=install_iso,
+                    seed_iso=seed_iso,
+                    net_name=net_name,
+                    headless=headless,
+                    serial_log=serial_log,
+                    reboot_policy=reboot_policy,
+                    disk_format=disk_format,
+                    emulate_nvme=test_boot,
+                ),
+            )
+        except Exception:
+            self._storage.delete_vm_storage(caller_project_id, vm_id)
+            raise
 
         vm = VMRecord(
             id=vm_id,
@@ -610,16 +751,18 @@ class BoxerDaemon:
             lease_until=lease_until,
             tags=tags,
             artifact_type="iso",
-            install_state="installing",
+            install_state=None if test_boot else "installing",
         )
         await self._db.insert_vm(vm)
         await self._db.add_event(
             "INFO",
-            f"ISO install '{purpose}' ({vm_id}) started from {template} (method={method})",
+            f"{'Test boot' if test_boot else 'ISO install'} '{purpose}' ({vm_id}) "
+            f"started from {template} (method={method})",
             project_id=caller_project_id,
             vm_id=vm_id,
         )
-        asyncio.create_task(self._watch_install(vm_id, libvirt_name))
+        if not test_boot:
+            asyncio.create_task(self._watch_install(vm_id, libvirt_name))
         return vm
 
     async def _watch_install(
@@ -664,10 +807,22 @@ class BoxerDaemon:
             logger.exception("Install watcher failed for %s", vm_id)
             await self._db.update_vm_install_state(vm_id, "failed")
 
+    async def _wait_for_install(self, vm_id: str, timeout_seconds: int) -> str:
+        """Poll DB until install_state reaches a terminal value or timeout_seconds elapses."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        while loop.time() < deadline:
+            vm = await self._db.get_vm(vm_id)
+            if vm and vm.install_state in ("installed", "failed"):
+                return vm.install_state
+            await asyncio.sleep(10)
+        return "timeout"
+
     async def _create_vm(
         self,
         *,
         caller_project_id: str,
+        caller_project_path: str,
         caller_user: str,
         template: str,
         purpose: str,
@@ -688,7 +843,7 @@ class BoxerDaemon:
         lease_until = now + timedelta(minutes=ttl_minutes)
         bootstrap = bootstrap or {"packages": [], "commands": [], "ssh_public_keys": [], "write_files": []}
 
-        await self._db.upsert_project(caller_project_id, "unknown")
+        await self._db.upsert_project(caller_project_id, caller_project_path)
 
         base_path = await self._image_manager.ensure_image(template)
         vm_dir = self._storage.vm_dir(caller_project_id, vm_id)
@@ -711,25 +866,31 @@ class BoxerDaemon:
             runcmd=bootstrap["commands"],
             write_files=bootstrap.get("write_files") or [],
         )
+        self._storage.prepare_readonly_file(cloud_init_iso)
 
         net_name = self._network.ensure_project_network(caller_project_id)
         serial_log = vm_dir / "serial.log"
+        self._storage.prepare_mutable_file(serial_log, create=True)
 
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: self._vm_ops.define_and_start(
-                libvirt_name=libvirt_name,
-                vm_id=vm_id,
-                cpu=cpu,
-                ram_mb=ram_mb,
-                disk_path=overlay_path,
-                cloud_init_iso=cloud_init_iso,
-                net_name=net_name,
-                headless=headless,
-                serial_log=serial_log,
-            ),
-        )
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: self._vm_ops.define_and_start(
+                    libvirt_name=libvirt_name,
+                    vm_id=vm_id,
+                    cpu=cpu,
+                    ram_mb=ram_mb,
+                    disk_path=overlay_path,
+                    cloud_init_iso=cloud_init_iso,
+                    net_name=net_name,
+                    headless=headless,
+                    serial_log=serial_log,
+                ),
+            )
+        except Exception:
+            self._storage.delete_vm_storage(caller_project_id, vm_id)
+            raise
 
         vm = VMRecord(
             id=vm_id,
@@ -1070,6 +1231,38 @@ class BoxerDaemon:
         await self._guest.send_input(vm.libvirt_name, actions)
         await self._db.touch_vm(vm_id)
         return {"vm_id": vm_id, "actions_sent": len(actions)}
+
+    # ------------------------------------------------------------------ vm.serial_log
+
+    async def _h_vm_serial_log(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        vm_id = params.get("vm_id")
+        tail_lines = max(1, min(int(params.get("tail_lines", 200) or 200), 5000))
+        if not vm_id:
+            raise IPCError(ERR_INVALID_PARAMS, "vm_id required")
+        vm = await self._db.get_vm(vm_id)
+        self._policy.check("vm.serial_log", caller, vm)
+
+        serial_log = self._storage.vm_dir(vm.project_id, vm_id) / "serial.log"
+        if not serial_log.exists():
+            return {
+                "vm_id": vm_id,
+                "lines": [],
+                "total_lines": 0,
+                "returned_lines": 0,
+                "note": "No serial log yet",
+            }
+
+        loop = asyncio.get_running_loop()
+        text = await loop.run_in_executor(None, lambda: serial_log.read_text(errors="replace"))
+        all_lines = text.splitlines()
+        total = len(all_lines)
+        return {
+            "vm_id": vm_id,
+            "lines": all_lines[-tail_lines:],
+            "total_lines": total,
+            "returned_lines": min(tail_lines, total),
+        }
 
     # ------------------------------------------------------------------ image.preflight
 

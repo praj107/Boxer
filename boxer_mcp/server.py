@@ -17,8 +17,10 @@ def _derive_project_id(project_dir: str) -> str:
 
 def get_caller_params() -> dict[str, Any]:
     project_dir = os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd())
+    project_path = os.path.realpath(project_dir)
     return {
-        "caller_project_id": _derive_project_id(project_dir),
+        "caller_project_id": _derive_project_id(project_path),
+        "caller_project_path": project_path,
         "caller_user": os.environ.get("USER", "unknown"),
         "caller_is_admin": False,
     }

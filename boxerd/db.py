@@ -146,10 +146,13 @@ class Database:
     async def upsert_project(self, project_id: str, path: str) -> None:
         async with self._conn() as db:
             now = _now()
+            project_path = path or "unknown"
+            if project_path == "unknown":
+                project_path = f"unknown:{project_id}"
             await db.execute(
                 """INSERT INTO projects(id, path, first_seen, last_seen) VALUES(?,?,?,?)
                    ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen, path=excluded.path""",
-                (project_id, path, now, now),
+                (project_id, project_path, now, now),
             )
             await db.commit()
 

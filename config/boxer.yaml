@@ -33,3 +33,13 @@ network_prefix_len: 24
 
 # Admin group (can bypass project_id ownership checks via CLI)
 admin_group: boxer-admin
+
+# Group used by libvirt/QEMU worker processes to read/write VM artifacts.
+# Debian/Ubuntu libvirt packages run QEMU with group kvm by default.
+qemu_group: kvm
+
+# Local ISO support (for OS development / custom ISO test boots)
+# When set, iso_path in box_request_installer must resolve under this directory.
+# When unset (default), any accessible ISO path is accepted — suitable for a
+# single-developer workstation where all IPC callers are trusted.
+# local_iso_dir: /var/lib/boxer/local-isos

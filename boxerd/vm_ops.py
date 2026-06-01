@@ -2,17 +2,58 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import libvirt
+import libvirt_qemu
 
 from boxer.config import BoxerConfig, get_config
 
 logger = logging.getLogger(__name__)
+
+_BOXER_METADATA_NS = "https://github.com/boxer-vm/boxer"
+_NVME_DEVICE_ID = "boxer-nvme0"
+_NVME_BUS_CANDIDATES = ("pci.1",) + tuple(f"pci.{idx}" for idx in range(16, 1, -1))
+
+
+def _libvirt_uuid(name: str, vm_id: str) -> str:
+    """Return a stable canonical UUID for libvirt domain XML."""
+    try:
+        return str(uuid.UUID(vm_id))
+    except ValueError:
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"boxer://{name}/{vm_id}"))
+
+
+def _qmp_error_desc(response: dict[str, Any]) -> str:
+    error = response.get("error")
+    if isinstance(error, dict):
+        return str(error.get("desc") or error.get("class") or error)
+    return str(error or response)
+
+
+def _xml_nvme_emulation_enabled(xml: str) -> bool:
+    root = ET.fromstring(xml)
+    for child in root.findall("metadata/{%s}nvme" % _BOXER_METADATA_NS):
+        if child.get("enabled") == "true":
+            return True
+    return False
+
+
+def _xml_primary_disk_path(xml: str) -> Path:
+    root = ET.fromstring(xml)
+    for disk in root.findall("./devices/disk"):
+        if disk.get("device") != "disk":
+            continue
+        source = disk.find("source")
+        path = source.get("file") if source is not None else None
+        if path:
+            return Path(path)
+    raise RuntimeError("Domain XML does not contain a primary file-backed disk")
 
 
 def _domain_xml(
@@ -27,6 +68,7 @@ def _domain_xml(
     headless: bool,
     serial_log: Path,
 ) -> str:
+    libvirt_uuid = _libvirt_uuid(name, vm_id)
     display_section = ""
     if not headless:
         display_section = """
@@ -49,7 +91,7 @@ def _domain_xml(
 
     return f"""<domain type='kvm'>
   <name>{name}</name>
-  <uuid>{vm_id}</uuid>
+  <uuid>{libvirt_uuid}</uuid>
   <memory unit='MiB'>{ram_mb}</memory>
   <currentMemory unit='MiB'>{ram_mb}</currentMemory>
   <vcpu placement='static'>{cpu}</vcpu>
@@ -73,7 +115,7 @@ def _domain_xml(
   <devices>
     <emulator>/usr/bin/qemu-system-x86_64</emulator>
     <disk type='file' device='disk'>
-      <driver name='qemu' type='qcow2' cache='writeback' io='native'/>
+      <driver name='qemu' type='qcow2' cache='writeback'/>
       <source file='{disk_path}'/>
       <target dev='vda' bus='virtio'/>
     </disk>{cdrom_section}
@@ -113,13 +155,46 @@ def _installer_domain_xml(
     net_name: str,
     headless: bool,
     serial_log: Path,
+    reboot_policy: str = "destroy",
+    disk_format: str = "qcow2",
+    emulate_nvme: bool = False,
 ) -> str:
     """Domain XML for an ISO installer: blank target disk, ISO booted first.
 
     Per-device ``<boot order>`` is used (order 1 = install ISO, order 2 = target
     disk) so that after the install completes the ISO can be detached and the
     disk becomes the only bootable device. SPICE is on by default for installs.
+
+    reboot_policy controls ``<on_reboot>``:
+    - "destroy" (default): end-of-install reboot transitions domain to stopped,
+      which is the completion signal used by the install watcher.
+    - "restart": domain survives reboots — appropriate for test-boot VMs where
+      the ISO is the final runtime, not a transient installer.
     """
+    libvirt_uuid = _libvirt_uuid(name, vm_id)
+    if disk_format not in {"qcow2", "raw"}:
+        raise ValueError(f"Unsupported installer disk format: {disk_format}")
+    if emulate_nvme and disk_format != "raw":
+        raise ValueError("NVMe emulation requires a raw installer disk")
+
+    metadata_section = ""
+    if emulate_nvme:
+        metadata_section = f"""
+  <metadata>
+    <boxer:nvme xmlns:boxer='{_BOXER_METADATA_NS}' enabled='true'/>
+  </metadata>"""
+
+    nvme_root_port_section = ""
+    if emulate_nvme:
+        # QEMU's nvme device must be hotplugged onto a PCIe root port. Reserving
+        # index 1 gives the QMP attach path a deterministic free bus: pci.1.
+        nvme_root_port_section = """
+    <controller type='pci' index='1' model='pcie-root-port'/>"""
+
+    disk_shareable = ""
+    if emulate_nvme:
+        disk_shareable = "      <shareable/>\n"
+
     display_section = ""
     if not headless:
         display_section = """
@@ -142,7 +217,7 @@ def _installer_domain_xml(
 
     return f"""<domain type='kvm'>
   <name>{name}</name>
-  <uuid>{vm_id}</uuid>
+  <uuid>{libvirt_uuid}</uuid>{metadata_section}
   <memory unit='MiB'>{ram_mb}</memory>
   <currentMemory unit='MiB'>{ram_mb}</currentMemory>
   <vcpu placement='static'>{cpu}</vcpu>
@@ -160,15 +235,15 @@ def _installer_domain_xml(
     <timer name='hpet' present='no'/>
   </clock>
   <on_poweroff>destroy</on_poweroff>
-  <on_reboot>destroy</on_reboot>
+  <on_reboot>{reboot_policy}</on_reboot>
   <on_crash>destroy</on_crash>
   <devices>
-    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>{nvme_root_port_section}
     <disk type='file' device='disk'>
-      <driver name='qemu' type='qcow2' cache='writeback' io='native'/>
+      <driver name='qemu' type='{disk_format}' cache='writeback'/>
       <source file='{disk_path}'/>
       <target dev='vda' bus='virtio'/>
-      <boot order='2'/>
+{disk_shareable}      <boot order='2'/>
     </disk>
     <disk type='file' device='cdrom'>
       <driver name='qemu' type='raw'/>
@@ -242,6 +317,128 @@ class VMOperations:
         self._conn = conn
         self._cfg = cfg or get_config()
 
+    @staticmethod
+    def _discard_failed_define(dom: libvirt.virDomain) -> None:
+        try:
+            if dom.isActive():
+                dom.destroy()
+        except libvirt.libvirtError:
+            pass
+        try:
+            dom.undefineFlags(
+                libvirt.VIR_DOMAIN_UNDEFINE_NVRAM
+                | libvirt.VIR_DOMAIN_UNDEFINE_SNAPSHOTS_METADATA
+            )
+        except libvirt.libvirtError:
+            try:
+                dom.undefine()
+            except libvirt.libvirtError:
+                pass
+
+    @staticmethod
+    def _safe_destroy(dom: libvirt.virDomain) -> None:
+        try:
+            if dom.isActive():
+                dom.destroy()
+        except libvirt.libvirtError:
+            pass
+
+    def _qmp(self, dom: libvirt.virDomain, command: dict[str, Any]) -> dict[str, Any]:
+        raw = libvirt_qemu.qemuMonitorCommand(
+            dom,
+            json.dumps(command),
+            libvirt_qemu.VIR_DOMAIN_QEMU_MONITOR_COMMAND_DEFAULT,
+        )
+        return json.loads(raw)
+
+    def _qmp_return(self, dom: libvirt.virDomain, command: dict[str, Any]) -> Any:
+        response = self._qmp(dom, command)
+        if "error" in response:
+            raise RuntimeError(
+                f"QMP {command.get('execute')} failed: {_qmp_error_desc(response)}"
+            )
+        return response.get("return")
+
+    def _block_node_for_disk(self, dom: libvirt.virDomain, disk_path: Path) -> str:
+        blocks = self._qmp_return(dom, {"execute": "query-block"})
+        candidates = {str(disk_path)}
+        try:
+            candidates.add(str(disk_path.resolve()))
+        except OSError:
+            pass
+
+        for block in blocks or []:
+            inserted = block.get("inserted") or {}
+            paths = {
+                inserted.get("file"),
+                (inserted.get("image") or {}).get("filename"),
+            }
+            if not any(path in candidates for path in paths if path):
+                continue
+            node = inserted.get("node-name")
+            if node:
+                return str(node)
+        raise RuntimeError(f"QMP block node not found for disk {disk_path}")
+
+    def _attach_nvme_disk(
+        self,
+        dom: libvirt.virDomain,
+        *,
+        disk_path: Path,
+        vm_id: str,
+    ) -> None:
+        node = self._block_node_for_disk(dom, disk_path)
+        serial_suffix = "".join(ch for ch in vm_id if ch.isalnum())[:20] or uuid.uuid4().hex[:12]
+        base_args: dict[str, Any] = {
+            "driver": "nvme",
+            "id": _NVME_DEVICE_ID,
+            "drive": node,
+            "serial": f"boxer-{serial_suffix}",
+            "share-rw": True,
+        }
+
+        last_error = "no PCIe root port candidates tried"
+        for bus in _NVME_BUS_CANDIDATES:
+            response = self._qmp(
+                dom,
+                {
+                    "execute": "device_add",
+                    "arguments": {**base_args, "bus": bus},
+                },
+            )
+            if "return" in response:
+                logger.info("Attached NVMe device %s on %s", _NVME_DEVICE_ID, bus)
+                return
+
+            last_error = _qmp_error_desc(response)
+            if any(
+                fragment in last_error
+                for fragment in (
+                    "not found",
+                    "not available",
+                    "does not support hotplugging",
+                )
+            ):
+                continue
+            raise RuntimeError(f"QMP device_add nvme failed: {last_error}")
+
+        raise RuntimeError(f"QMP device_add nvme failed: {last_error}")
+
+    def _create_with_nvme(
+        self,
+        dom: libvirt.virDomain,
+        *,
+        disk_path: Path,
+        vm_id: str,
+    ) -> None:
+        dom.createWithFlags(libvirt.VIR_DOMAIN_START_PAUSED)
+        try:
+            self._attach_nvme_disk(dom, disk_path=disk_path, vm_id=vm_id)
+            dom.resume()
+        except Exception:
+            self._safe_destroy(dom)
+            raise
+
     def define_and_start(
         self,
         *,
@@ -267,8 +464,12 @@ class VMOperations:
             serial_log=serial_log,
         )
         dom = self._conn.defineXML(xml)
-        dom.setAutostart(0)
-        dom.create()
+        try:
+            dom.setAutostart(0)
+            dom.create()
+        except libvirt.libvirtError:
+            self._discard_failed_define(dom)
+            raise
         logger.info("Defined and started domain %s", libvirt_name)
         return dom
 
@@ -285,6 +486,9 @@ class VMOperations:
         net_name: str,
         headless: bool,
         serial_log: Path,
+        reboot_policy: str = "destroy",
+        disk_format: str = "qcow2",
+        emulate_nvme: bool = False,
     ) -> libvirt.virDomain:
         xml = _installer_domain_xml(
             name=libvirt_name,
@@ -297,10 +501,20 @@ class VMOperations:
             net_name=net_name,
             headless=headless,
             serial_log=serial_log,
+            reboot_policy=reboot_policy,
+            disk_format=disk_format,
+            emulate_nvme=emulate_nvme,
         )
         dom = self._conn.defineXML(xml)
-        dom.setAutostart(0)
-        dom.create()
+        try:
+            dom.setAutostart(0)
+            if emulate_nvme:
+                self._create_with_nvme(dom, disk_path=disk_path, vm_id=vm_id)
+            else:
+                dom.create()
+        except Exception:
+            self._discard_failed_define(dom)
+            raise
         logger.info("Defined and started installer domain %s", libvirt_name)
         return dom
 
@@ -339,7 +553,15 @@ class VMOperations:
         try:
             dom = self._conn.lookupByName(libvirt_name)
             if dom.isActive() == 0:
-                dom.create()
+                xml = dom.XMLDesc(0)
+                if _xml_nvme_emulation_enabled(xml):
+                    self._create_with_nvme(
+                        dom,
+                        disk_path=_xml_primary_disk_path(xml),
+                        vm_id=libvirt_name,
+                    )
+                else:
+                    dom.create()
         except libvirt.libvirtError as exc:
             raise RuntimeError(f"Failed to start {libvirt_name}: {exc}") from exc
 

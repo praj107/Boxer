@@ -42,7 +42,7 @@ async def box_prewarm_image(
 
 @mcp.tool()
 async def box_request_vm(
-    template: Annotated[str, "OS template name (e.g. ubuntu-24.04, debian-12, fedora-44)"],
+    template: Annotated[str, "Cloud-image catalog name (e.g. ubuntu-24.04, debian-12, fedora-44). For local ISO files use box_request_installer(iso_path=...) instead."],
     purpose: Annotated[str, "Short name/purpose for the VM, used as hostname prefix"],
     headless: Annotated[bool, "True for no display (CLI-only), False for SPICE display"] = True,
     ttl_minutes: Annotated[int, "Lease duration in minutes before VM is marked stale"] = 60,
@@ -114,31 +114,43 @@ async def box_list_profiles() -> list[dict[str, Any]]:
 
 @mcp.tool()
 async def box_request_installer(
-    template: Annotated[str, "Installer ISO template name (type: iso in the catalog, e.g. arch-latest)"],
     purpose: Annotated[str, "Short name/purpose for the VM, used as hostname prefix"],
-    headless: Annotated[bool, "True for no display; only valid for unattended install methods (autoinstall/preseed/kickstart)"] = False,
+    template: Annotated[Optional[str], "Catalog installer ISO template name (type: iso, e.g. arch-latest). Mutually exclusive with iso_path."] = None,
+    iso_path: Annotated[Optional[str], "Absolute host path to a locally-built ISO file. If local_iso_dir is set in boxer.yaml, the path must resolve under it. Mutually exclusive with template."] = None,
+    install_method: Annotated[Optional[str], "Seed method when using iso_path: manual (default, headed SPICE or serial), ubuntu (autoinstall), debian (preseed), fedora or rhel (kickstart)"] = None,
+    headless: Annotated[Optional[bool], "True for serial-only (no SPICE display). Defaults True for iso_path, False for catalog manual installs. Valid for all unattended seed methods."] = None,
     ttl_minutes: Annotated[int, "Lease duration in minutes (installs default to a longer lease)"] = 180,
-    cpu: Annotated[Optional[int], "Number of vCPUs (default from template)"] = None,
-    ram_mb: Annotated[Optional[int], "RAM in MiB (default from template)"] = None,
-    disk_gb: Annotated[Optional[int], "Blank target disk size in GiB (default from template)"] = None,
+    cpu: Annotated[Optional[int], "Number of vCPUs (default from template or 2)"] = None,
+    ram_mb: Annotated[Optional[int], "RAM in MiB (default from template or 2048)"] = None,
+    disk_gb: Annotated[Optional[int], "Blank target disk size in GiB (default from template or 20)"] = None,
     bootstrap_packages: Annotated[Optional[list[str]], "Extra packages to include in the unattended install seed"] = None,
     ssh_public_keys: Annotated[Optional[list[str]], "OpenSSH public keys to authorize for the installed user"] = None,
+    wait_install_seconds: Annotated[int, "Block until install_state=installed/failed or this many seconds elapse (0=return immediately, max 1800). Use box_get_serial_log to monitor progress."] = 0,
     tags: Annotated[Optional[dict[str, str]], "Optional key-value tags"] = None,
 ) -> dict[str, Any]:
     """Provision a VM from an installer ISO (blank disk, ISO booted first).
 
-    The catalog entry's install method (manual/ubuntu/debian/fedora) decides
-    whether an unattended seed is generated. Boxer boots the ISO, and once the
-    installer powers off it switches boot order to the installed disk and starts
-    the VM. Returns vm_id immediately with install_state=installing, or queued
-    status if the installer concurrency limit is reached. Poll box_get_vm.
+    Accepts either a catalog template (template=...) or a locally-built ISO file
+    (iso_path=...). The install method decides whether an unattended seed is
+    generated. Boxer boots the ISO, and once the installer powers off it switches
+    boot order to the installed disk and starts the VM. Local iso_path +
+    install_method=manual is a test-boot mode: no install watcher is started,
+    and the blank target disk is exposed as NVMe for custom OS storage tests.
+
+    Returns vm_id immediately with install_state=installing, or blocks until
+    installation completes when wait_install_seconds > 0. Queued status is
+    returned if the installer concurrency limit is reached. Use box_get_serial_log
+    to stream serial console output during installation.
     """
-    params: dict[str, Any] = {
-        "template": template,
-        "purpose": purpose,
-        "headless": headless,
-        "ttl_minutes": ttl_minutes,
-    }
+    params: dict[str, Any] = {"purpose": purpose, "ttl_minutes": ttl_minutes}
+    if template is not None:
+        params["template"] = template
+    if iso_path is not None:
+        params["iso_path"] = iso_path
+    if install_method is not None:
+        params["install_method"] = install_method
+    if headless is not None:
+        params["headless"] = headless
     if cpu is not None:
         params["cpu"] = cpu
     if ram_mb is not None:
@@ -149,6 +161,8 @@ async def box_request_installer(
         params["bootstrap_packages"] = bootstrap_packages
     if ssh_public_keys:
         params["ssh_public_keys"] = ssh_public_keys
+    if wait_install_seconds:
+        params["wait_install_seconds"] = wait_install_seconds
     if tags:
         params["tags"] = tags
     return await ipc("vm.request_installer", params)
@@ -271,6 +285,20 @@ async def box_input(
 ) -> dict[str, Any]:
     """Send keyboard or mouse input to a headed VM."""
     return await ipc("vm.input", {"vm_id": vm_id, "actions": actions})
+
+
+@mcp.tool()
+async def box_get_serial_log(
+    vm_id: Annotated[str, "VM ID"],
+    tail_lines: Annotated[int, "Number of lines to return from the end of the log (default 200, max 5000)"] = 200,
+) -> dict[str, Any]:
+    """Read the serial console log of a VM.
+
+    Returns the last tail_lines lines from the VM's serial console output.
+    Useful for monitoring installer VMs during unattended or custom OS installation,
+    and for debugging cloud-init failures on headless VMs.
+    """
+    return await ipc("vm.serial_log", {"vm_id": vm_id, "tail_lines": tail_lines})
 
 
 @mcp.tool()

@@ -254,6 +254,7 @@ readonly CONFIG_DIR="/etc/boxer"
 readonly STATE_DIR="/var/lib/boxer"
 readonly SSH_KEY_PATH="${CONFIG_DIR}/boxer_id_ed25519"
 readonly CONFIG_GROUP="libvirt"
+readonly QEMU_GROUP="kvm"
 
 if [[ -z "${INSTALL_USER}" ]]; then
     warn "Could not determine the target user (SUDO_USER is unset)."
@@ -361,7 +362,7 @@ fi
 info "Creating directories…"
 run_cmd install -d -m 0755 "${CONFIG_DIR}"
 run_cmd install -d -m 0755 "${CONFIG_DIR}/keyrings"
-run_cmd install -d -m 0750 -o root -g libvirt "${STATE_DIR}"
+run_cmd install -d -m 0750 -o root -g "${QEMU_GROUP}" "${STATE_DIR}"
 run_cmd install -d -m 0750 -o root -g libvirt "${INSTALL_DIR}"
 ok "Directories created."
 _record_step "directories"

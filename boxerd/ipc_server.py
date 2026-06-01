@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Optional
 
@@ -94,9 +95,21 @@ class IPCServer:
 
                 req_id = msg.get("id")
                 method = msg.get("method")
-                params = msg.get("params", {})
+                params = msg.get("params", {}) or {}
+
+                # Per-request audit logging — always emitted so failures are traceable.
+                caller_project = params.get("caller_project_id", "-") if isinstance(params, dict) else "-"
+                caller_user = params.get("caller_user", "-") if isinstance(params, dict) else "-"
+                req_tag = f"[{method}] project={caller_project} user={caller_user}"
+                t0 = time.monotonic()
+                logger.debug("IPC req  %s", req_tag)
 
                 if method not in handlers:
+                    elapsed_ms = (time.monotonic() - t0) * 1000
+                    logger.warning(
+                        "IPC err  %s  %.0fms  code=%d  unknown method",
+                        req_tag, elapsed_ms, ERR_METHOD_NOT_FOUND,
+                    )
                     await write_message(
                         writer,
                         make_error_response(req_id, ERR_METHOD_NOT_FOUND, f"unknown method: {method}"),
@@ -105,13 +118,23 @@ class IPCServer:
 
                 try:
                     result = await handlers[method](params)
+                    elapsed_ms = (time.monotonic() - t0) * 1000
+                    logger.info("IPC ok   %s  %.0fms", req_tag, elapsed_ms)
                     await write_message(writer, make_response(req_id, result))
                 except IPCError as exc:
+                    elapsed_ms = (time.monotonic() - t0) * 1000
+                    logger.warning(
+                        "IPC err  %s  %.0fms  code=%d  %s",
+                        req_tag, elapsed_ms, exc.code, exc.message,
+                    )
                     await write_message(
                         writer, make_error_response(req_id, exc.code, exc.message, exc.data)
                     )
                 except Exception as exc:
-                    logger.exception("Error in handler %s", method)
+                    elapsed_ms = (time.monotonic() - t0) * 1000
+                    logger.exception(
+                        "IPC exc  %s  %.0fms", req_tag, elapsed_ms
+                    )
                     await write_message(
                         writer, make_error_response(req_id, ERR_INTERNAL, str(exc))
                     )

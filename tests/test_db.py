@@ -48,6 +48,21 @@ async def test_insert_and_get_vm(db: Database) -> None:
 
 
 @pytest.mark.asyncio
+async def test_unknown_project_paths_are_disambiguated(db: Database) -> None:
+    await db.upsert_project("p_aaa111", "unknown")
+    await db.upsert_project("p_bbb222", "unknown")
+
+    async with db._conn() as conn:
+        async with conn.execute("SELECT id,path FROM projects ORDER BY id") as cur:
+            rows = await cur.fetchall()
+
+    assert [(row["id"], row["path"]) for row in rows] == [
+        ("p_aaa111", "unknown:p_aaa111"),
+        ("p_bbb222", "unknown:p_bbb222"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_list_vms_by_project(db: Database) -> None:
     await db.upsert_project("p_aaa111", "/a")
     await db.upsert_project("p_bbb222", "/b")

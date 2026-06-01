@@ -32,6 +32,16 @@ The script installs system packages, enables `libvirtd`, creates the `boxer-admi
 
 **After setup, log out and back in** (or reboot) before starting the daemon or registering the MCP server. Group membership changes (`libvirt`, `kvm`, `boxer-admin`) are not visible to your running session until you do, and MCP clients will receive `EACCES` when trying to access `/opt/boxer/` without them.
 
+Boxer stores VM disks, generated seed ISOs, and staged local ISOs under
+`/var/lib/boxer` with access for the configured QEMU group (`qemu_group`, default
+`kvm`). For `box_request_installer(iso_path=...)`, Boxer copies the caller's ISO
+into the VM directory before booting so system libvirt can read it even when the
+source ISO lives under a private home directory.
+
+Local `install_method="manual"` ISO test boots use a raw blank target disk and
+attach it as QEMU NVMe before the guest starts. The ISO still boots first; the
+NVMe disk is present for custom OS storage tests.
+
 Start the daemon:
 
 ```bash
@@ -42,6 +52,12 @@ journalctl -u boxerd -f
 ## Adding to MCP clients
 
 All clients use the stdio transport. The server binary is `/opt/boxer/venv/bin/boxer-mcp` (or wherever the venv lives).
+
+`boxer-mcp` is a per-client stdio child process. If you reinstall Boxer while an
+agent session is running, restart the MCP client/session before relying on new
+MCP tool code. `scripts/reload.sh` leaves active MCP children alone by default;
+use `sudo bash scripts/reload.sh --restart-mcp` only when you are ready for
+existing MCP transports to close.
 
 ### Claude Code
 

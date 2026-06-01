@@ -21,6 +21,7 @@ _OWNERSHIP_REQUIRED_ACTIONS = {
     "vm.exec",
     "vm.screenshot",
     "vm.input",
+    "vm.serial_log",
     "vm.purge_ghost",
 }
 

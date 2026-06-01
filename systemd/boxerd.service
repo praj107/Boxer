@@ -6,7 +6,7 @@ Requires=libvirtd.service
 [Service]
 Type=simple
 User=root
-Group=libvirt
+Group=kvm
 ExecStart=/usr/bin/python3 -m boxerd
 Restart=on-failure
 RestartSec=5
