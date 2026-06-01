@@ -108,9 +108,19 @@ trap 'cleanup' EXIT INT TERM
 
 _sed_inplace() {
     local file="$1" expr="$2"
-    local tmp
+    local tmp mode owner group
+    mode=$(stat -c '%a' "${file}")
+    owner=$(stat -c '%u' "${file}")
+    group=$(stat -c '%g' "${file}")
     tmp=$(_mktmp -- "${file}.XXXXXX")
-    sed "${expr}" "${file}" > "${tmp}" && mv -f "${tmp}" "${file}" || { rm -f "${tmp}"; return 1; }
+    if sed "${expr}" "${file}" > "${tmp}"; then
+        chmod "${mode}" "${tmp}"
+        chown "${owner}:${group}" "${tmp}"
+        mv -f "${tmp}" "${file}"
+    else
+        rm -f "${tmp}"
+        return 1
+    fi
 }
 
 # ── dry-run command runner ─────────────────────────────────────────────────────
@@ -204,7 +214,7 @@ fi
 
 _check_deps() {
     local tool missing=()
-    local tools=(virsh ssh-keygen systemctl apt-get python3 flock getent groupadd usermod sed mktemp install gpgv)
+    local tools=(virsh ssh-keygen systemctl apt-get python3 flock getent groupadd usermod sed mktemp install stat gpgv)
     for tool in "${tools[@]}"; do
         command -v "${tool}" &>/dev/null || missing+=("${tool}")
     done
@@ -218,7 +228,7 @@ _check_deps() {
 # check for the tools required before that step.
 _check_early_deps() {
     local tool missing=()
-    local tools=(apt-get python3 flock sed mktemp install)
+    local tools=(apt-get python3 flock sed mktemp install stat)
     for tool in "${tools[@]}"; do
         command -v "${tool}" &>/dev/null || missing+=("${tool}")
     done
@@ -243,6 +253,7 @@ readonly VENV_DIR="${INSTALL_DIR}/venv"
 readonly CONFIG_DIR="/etc/boxer"
 readonly STATE_DIR="/var/lib/boxer"
 readonly SSH_KEY_PATH="${CONFIG_DIR}/boxer_id_ed25519"
+readonly CONFIG_GROUP="libvirt"
 
 if [[ -z "${INSTALL_USER}" ]]; then
     warn "Could not determine the target user (SUDO_USER is unset)."
@@ -360,17 +371,20 @@ _record_step "directories"
 info "Installing config files to ${CONFIG_DIR}…"
 
 _install_config() {
-    local src="$1" dst="$2" mode="${3:-0640}"
+    local src="$1" dst="$2" mode="${3:-0640}" owner="${4:-root}" group="${5:-${CONFIG_GROUP}}"
     if [[ ! -f "${dst}" ]]; then
         local tmp
         tmp=$(_mktmp -- "${dst}.XXXXXX")
         cp -- "${src}" "${tmp}"
         chmod "${mode}" "${tmp}"
+        chown "${owner}:${group}" "${tmp}"
         run_cmd mv -f "${tmp}" "${dst}"
         ok "Copied $(basename "${dst}")"
     else
         ok "$(basename "${dst}") already present — skipped."
     fi
+    run_cmd chown "${owner}:${group}" "${dst}"
+    run_cmd chmod "${mode}" "${dst}"
 }
 
 if [[ "${DRY_RUN}" -eq 0 ]]; then
@@ -390,7 +404,7 @@ if [[ "${DRY_RUN}" -eq 0 ]]; then
     shopt -s nullglob
     for _kr in "${REPO_DIR}"/config/keyrings/*.gpg "${REPO_DIR}"/config/keyrings/*.kbx; do
         _kr_found=1
-        _install_config "${_kr}" "${CONFIG_DIR}/keyrings/$(basename "${_kr}")" 0644
+        _install_config "${_kr}" "${CONFIG_DIR}/keyrings/$(basename "${_kr}")" 0644 root root
     done
     shopt -u nullglob
     if [[ "${_kr_found}" -eq 0 ]]; then
@@ -424,7 +438,10 @@ if [[ ! -f "${SSH_KEY_PATH}" ]]; then
         elif ! grep -q '^boxer_ssh_pubkey' "${CONFIG_DIR}/boxer.yaml"; then
             _tmp_yaml=$(_mktmp -- "${CONFIG_DIR}/boxer.yaml.XXXXXX")
             { cat "${CONFIG_DIR}/boxer.yaml"; printf 'boxer_ssh_pubkey: "%s"\n' "${_PUBKEY}"; } \
-                > "${_tmp_yaml}" && mv -f "${_tmp_yaml}" "${CONFIG_DIR}/boxer.yaml"
+                > "${_tmp_yaml}"
+            chmod 0640 "${_tmp_yaml}"
+            chown "root:${CONFIG_GROUP}" "${_tmp_yaml}"
+            mv -f "${_tmp_yaml}" "${CONFIG_DIR}/boxer.yaml"
         fi
 
         if grep -q '^# boxer_ssh_privkey_path' "${CONFIG_DIR}/boxer.yaml"; then
@@ -433,12 +450,23 @@ if [[ ! -f "${SSH_KEY_PATH}" ]]; then
         elif ! grep -q '^boxer_ssh_privkey_path' "${CONFIG_DIR}/boxer.yaml"; then
             _tmp_yaml2=$(_mktmp -- "${CONFIG_DIR}/boxer.yaml.XXXXXX")
             { cat "${CONFIG_DIR}/boxer.yaml"; printf 'boxer_ssh_privkey_path: %s\n' "${SSH_KEY_PATH}"; } \
-                > "${_tmp_yaml2}" && mv -f "${_tmp_yaml2}" "${CONFIG_DIR}/boxer.yaml"
+                > "${_tmp_yaml2}"
+            chmod 0640 "${_tmp_yaml2}"
+            chown "root:${CONFIG_GROUP}" "${_tmp_yaml2}"
+            mv -f "${_tmp_yaml2}" "${CONFIG_DIR}/boxer.yaml"
         fi
         ok "SSH keypair generated at ${SSH_KEY_PATH}"
     fi
 else
     ok "SSH keypair already exists at ${SSH_KEY_PATH} — skipped."
+fi
+if [[ "${DRY_RUN}" -eq 0 ]]; then
+    chown root:root "${SSH_KEY_PATH}" 2>/dev/null || true
+    chmod 0600 "${SSH_KEY_PATH}" 2>/dev/null || true
+    chown root:root "${SSH_KEY_PATH}.pub" 2>/dev/null || true
+    chmod 0644 "${SSH_KEY_PATH}.pub" 2>/dev/null || true
+    chown "root:${CONFIG_GROUP}" "${CONFIG_DIR}/boxer.yaml"
+    chmod 0640 "${CONFIG_DIR}/boxer.yaml"
 fi
 _record_step "ssh-keypair"
 

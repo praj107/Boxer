@@ -1,22 +1,48 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any, Optional
 
 import yaml
 
+_CONFIG_ENV = "BOXER_CONFIG_PATH"
+_IMAGES_ENV = "BOXER_IMAGES_PATH"
 _DEFAULT_CONFIG_PATH = Path("/etc/boxer/boxer.yaml")
 _DEFAULT_IMAGES_PATH = Path("/etc/boxer/images.yaml")
 _FALLBACK_CONFIG_PATH = Path(__file__).parent.parent / "config" / "boxer.yaml"
 _FALLBACK_IMAGES_PATH = Path(__file__).parent.parent / "config" / "images.yaml"
 
 
-def _load_yaml(primary: Path, fallback: Path) -> dict[str, Any]:
-    for p in (primary, fallback):
-        if p.exists():
-            with open(p) as f:
-                return yaml.safe_load(f) or {}
+class ConfigLoadError(RuntimeError):
+    """Raised when Boxer configuration exists but cannot be loaded."""
+
+
+def _configured_path(env_var: str) -> Optional[Path]:
+    import os
+
+    raw = os.environ.get(env_var)
+    return Path(raw).expanduser() if raw else None
+
+
+def _load_yaml(primary: Path, fallback: Path, *, env_var: str, label: str) -> dict[str, Any]:
+    override = _configured_path(env_var)
+    paths = [override] if override is not None else [primary, fallback]
+
+    for path in paths:
+        if path is None:
+            continue
+        try:
+            if path.exists():
+                with open(path) as f:
+                    return yaml.safe_load(f) or {}
+        except PermissionError as exc:
+            raise ConfigLoadError(
+                f"Cannot read Boxer {label} file at {path}. "
+                "Run setup again or repair permissions so the Boxer client user can read it."
+            ) from exc
+
+    if override is not None:
+        raise ConfigLoadError(f"{env_var} points to missing Boxer {label} file: {override}")
     return {}
 
 
@@ -140,14 +166,18 @@ _catalog: Optional[ImageCatalog] = None
 def get_config() -> BoxerConfig:
     global _config
     if _config is None:
-        _config = BoxerConfig(_load_yaml(_DEFAULT_CONFIG_PATH, _FALLBACK_CONFIG_PATH))
+        _config = BoxerConfig(
+            _load_yaml(_DEFAULT_CONFIG_PATH, _FALLBACK_CONFIG_PATH, env_var=_CONFIG_ENV, label="config")
+        )
     return _config
 
 
 def get_catalog() -> ImageCatalog:
     global _catalog
     if _catalog is None:
-        _catalog = ImageCatalog(_load_yaml(_DEFAULT_IMAGES_PATH, _FALLBACK_IMAGES_PATH))
+        _catalog = ImageCatalog(
+            _load_yaml(_DEFAULT_IMAGES_PATH, _FALLBACK_IMAGES_PATH, env_var=_IMAGES_ENV, label="image catalog")
+        )
     return _catalog
 
 
