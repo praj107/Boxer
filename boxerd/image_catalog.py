@@ -157,6 +157,12 @@ def _parse_checksum_manifest(text: str, filename: str, algorithm: str = "sha256"
             continue
 
         parts = line.split()
+        if (
+            len(parts) == 1
+            and len(parts[0]) == _HASH_LENGTHS[algorithm]
+            and re.fullmatch(r"[0-9a-fA-F]+", parts[0])
+        ):
+            return parts[0].lower()
         if len(parts) < 2:
             continue
         digest = parts[0].lower()

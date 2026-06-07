@@ -603,8 +603,46 @@ class VMOperations:
         except libvirt.libvirtError as exc:
             raise RuntimeError(f"Snapshot failed: {exc}") from exc
 
+    def _get_ip_via_dhcp_lease(self, libvirt_name: str) -> Optional[str]:
+        """Return the VM's IPv4 address from the libvirt network DHCP lease table.
+
+        This is a synchronous, non-blocking read; it returns None if the lease
+        is not present yet or if anything in the libvirt call chain fails.
+        """
+        try:
+            dom = self._conn.lookupByName(libvirt_name)
+            xml = dom.XMLDesc(0)
+            root = ET.fromstring(xml)
+            iface_el = root.find("./devices/interface[@type='network']")
+            if iface_el is None:
+                return None
+            mac_el = iface_el.find("mac")
+            src_el = iface_el.find("source")
+            if mac_el is None or src_el is None:
+                return None
+            mac = mac_el.get("address")
+            net_name = src_el.get("network")
+            if not mac or not net_name:
+                return None
+            net = self._conn.networkLookupByName(net_name)
+            for lease in net.DHCPLeases(mac, 0) or []:
+                if lease.get("type") == 0:  # AF_INET / IPv4
+                    ip = lease.get("ipaddr")
+                    if ip and not ip.startswith("127."):
+                        return ip
+        except Exception:
+            pass
+        return None
+
     async def get_ip_via_guest_agent(self, libvirt_name: str, timeout: float = 30.0) -> Optional[str]:
-        """Poll QEMU guest agent for the VM's primary IP address."""
+        """Poll for the VM's primary IPv4 address.
+
+        Tries the QEMU guest agent first on each iteration (authoritative,
+        works behind NAT); falls back to the libvirt DHCP lease table when the
+        guest agent is not yet ready.  The DHCP fallback lets IP discovery
+        succeed even on distros where qemu-guest-agent starts late (e.g. SELinux
+        policy races on Fedora) or is unavailable.
+        """
         import json as _json
 
         deadline = asyncio.get_running_loop().time() + timeout
@@ -625,5 +663,8 @@ class VMOperations:
                                 return ip
             except Exception:
                 pass
+            ip = self._get_ip_via_dhcp_lease(libvirt_name)
+            if ip:
+                return ip
             await asyncio.sleep(2)
         return None

@@ -52,6 +52,10 @@ def _render_user_data(hostname: str, options: CloudInitOptions) -> str:
     packages = _dedupe(["qemu-guest-agent", "openssh-server", *options.packages])
     runcmd = [
         "systemctl enable --now qemu-guest-agent || true",
+        # Ensure host keys exist before starting sshd; Debian cloud images
+        # occasionally miss this on first boot when the package postinst races
+        # with cloud-init's runcmd phase.
+        "ssh-keygen -A 2>/dev/null || true",
         "systemctl enable --now ssh || systemctl enable --now sshd || true",
         *options.runcmd,
     ]

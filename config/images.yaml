@@ -168,6 +168,312 @@ images:
     default_ram_mb: 2048
     default_disk_gb: 30
 
+  ubuntu-20.04:
+    type: cloud-image
+    family: ubuntu
+    refresh_policy: latest
+    description: "Ubuntu 20.04 LTS (Focal Fossa)"
+    url: "https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img"
+    sha256: null
+    verification:
+      mode: checksum-manifest
+      checksum_url: "https://cloud-images.ubuntu.com/focal/current/SHA256SUMS"
+      checksum_algorithm: sha256
+      checksum_filename: "focal-server-cloudimg-amd64.img"
+      signature:
+        mode: detached
+        signature_url: "https://cloud-images.ubuntu.com/focal/current/SHA256SUMS.gpg"
+        keyring: "ubuntu-cloudimage-keyring.gpg"
+        required: false
+    default_cpu: 2
+    default_ram_mb: 2048
+    default_disk_gb: 20
+
+  debian-11:
+    type: cloud-image
+    family: debian
+    refresh_policy: latest
+    description: "Debian 11 (Bullseye)"
+    url: "https://cdimage.debian.org/cdimage/cloud/bullseye/latest/debian-11-genericcloud-amd64.qcow2"
+    sha256: null
+    verification:
+      mode: checksum-manifest
+      checksum_url: "https://cdimage.debian.org/cdimage/cloud/bullseye/latest/SHA512SUMS"
+      checksum_algorithm: sha512
+      checksum_filename: "debian-11-genericcloud-amd64.qcow2"
+      signature:
+        mode: detached
+        signature_url: "https://cdimage.debian.org/cdimage/cloud/bullseye/latest/SHA512SUMS.sign"
+        keyring: "debian-cloud-keyring.gpg"
+        required: false
+    default_cpu: 2
+    default_ram_mb: 2048
+    default_disk_gb: 20
+
+  centos-stream-9:
+    type: cloud-image
+    family: centos
+    refresh_policy: latest
+    description: "CentOS Stream 9 GenericCloud"
+    url: "https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2"
+    sha256: null
+    verification:
+      # CentOS Stream ships a per-file SHA256SUM sidecar containing either a
+      # bare digest or "hash  filename" pairs; both formats are parsed.
+      mode: checksum-manifest
+      checksum_url: "https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2.SHA256SUM"
+      checksum_algorithm: sha256
+      checksum_filename: "CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2"
+    default_cpu: 2
+    default_ram_mb: 2048
+    default_disk_gb: 20
+
+  almalinux-8:
+    type: cloud-image
+    family: almalinux
+    refresh_policy: latest
+    description: "AlmaLinux 8 GenericCloud"
+    url: "https://repo.almalinux.org/almalinux/8/cloud/x86_64/images/AlmaLinux-8-GenericCloud-latest.x86_64.qcow2"
+    sha256: null
+    verification:
+      mode: checksum-manifest
+      checksum_url: "https://repo.almalinux.org/almalinux/8/cloud/x86_64/images/CHECKSUM"
+      checksum_algorithm: sha256
+      checksum_filename: "AlmaLinux-8-GenericCloud-latest.x86_64.qcow2"
+      signature:
+        mode: clearsigned
+        keyring: "almalinux-8-keyring.gpg"
+        required: false
+    default_cpu: 2
+    default_ram_mb: 2048
+    default_disk_gb: 20
+
+  rocky-8:
+    type: cloud-image
+    family: rocky
+    refresh_policy: latest
+    description: "Rocky Linux 8 GenericCloud"
+    url: "https://download.rockylinux.org/pub/rocky/8/images/x86_64/Rocky-8-GenericCloud.latest.x86_64.qcow2"
+    sha256: null
+    verification:
+      # Rocky uses a per-file CHECKSUM with "SHA256 (file) = hash" Fedora style.
+      mode: checksum-manifest
+      checksum_url: "https://download.rockylinux.org/pub/rocky/8/images/x86_64/Rocky-8-GenericCloud.latest.x86_64.qcow2.CHECKSUM"
+      checksum_algorithm: sha256
+      checksum_filename: "Rocky-8-GenericCloud.latest.x86_64.qcow2"
+    default_cpu: 2
+    default_ram_mb: 2048
+    default_disk_gb: 20
+
+  opensuse-leap-15.6:
+    type: cloud-image
+    family: opensuse
+    refresh_policy: latest
+    description: "openSUSE Leap 15.6 Minimal VM"
+    url: "https://download.opensuse.org/distribution/leap/15.6/appliances/openSUSE-Leap-15.6-Minimal-VM.x86_64-Cloud.qcow2"
+    sha256: null
+    verification:
+      # openSUSE ships a per-file .sha256 sidecar; content is either a bare
+      # digest or "hash  filename". Both forms are parsed correctly.
+      mode: checksum-manifest
+      checksum_url: "https://download.opensuse.org/distribution/leap/15.6/appliances/openSUSE-Leap-15.6-Minimal-VM.x86_64-Cloud.qcow2.sha256"
+      checksum_algorithm: sha256
+      checksum_filename: "openSUSE-Leap-15.6-Minimal-VM.x86_64-Cloud.qcow2"
+    default_cpu: 2
+    default_ram_mb: 2048
+    default_disk_gb: 20
+
+  alpine-3.23-cloud:
+    type: cloud-image
+    family: alpine
+    refresh_policy: latest
+    description: "Alpine Linux 3.23 NoCloud cloud image"
+    url: "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/nocloud_alpine-3.23.4-x86_64-bios-cloudinit-r0.qcow2"
+    sha256: null
+    verification:
+      mode: checksum-manifest
+      checksum_url: "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/nocloud_alpine-3.23.4-x86_64-bios-cloudinit-r0.qcow2.sha512"
+      checksum_algorithm: sha512
+      checksum_filename: "nocloud_alpine-3.23.4-x86_64-bios-cloudinit-r0.qcow2"
+    default_cpu: 1
+    default_ram_mb: 1024
+    default_disk_gb: 8
+
+  alpine-3.22-cloud:
+    type: cloud-image
+    family: alpine
+    refresh_policy: latest
+    description: "Alpine Linux 3.22 NoCloud cloud image (regression / Dropbear testing)"
+    # Pin to a known patch release; update when a newer 3.22.x is available.
+    url: "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/nocloud_alpine-3.22.2-x86_64-bios-cloudinit-r0.qcow2"
+    sha256: null
+    verification:
+      mode: checksum-manifest
+      checksum_url: "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/nocloud_alpine-3.22.2-x86_64-bios-cloudinit-r0.qcow2.sha512"
+      checksum_algorithm: sha512
+      checksum_filename: "nocloud_alpine-3.22.2-x86_64-bios-cloudinit-r0.qcow2"
+    default_cpu: 1
+    default_ram_mb: 1024
+    default_disk_gb: 8
+
+  freebsd-14.3-bootonly:
+    type: iso
+    family: freebsd
+    refresh_policy: latest
+    description: "FreeBSD 14.3 amd64 bootonly ISO"
+    url: "https://download.freebsd.org/releases/ISO-IMAGES/14.3/FreeBSD-14.3-RELEASE-amd64-bootonly.iso"
+    sha256: null
+    verification:
+      mode: checksum-manifest
+      checksum_url: "https://download.freebsd.org/releases/ISO-IMAGES/14.3/CHECKSUM.SHA256-FreeBSD-14.3-RELEASE-amd64"
+      checksum_algorithm: sha256
+      checksum_filename: "FreeBSD-14.3-RELEASE-amd64-bootonly.iso"
+    install:
+      method: manual
+    default_cpu: 2
+    default_ram_mb: 2048
+    default_disk_gb: 20
+
+  openbsd-7.9-install:
+    type: iso
+    family: openbsd
+    refresh_policy: latest
+    description: "OpenBSD 7.9 amd64 install ISO"
+    url: "https://cdn.openbsd.org/pub/OpenBSD/7.9/amd64/install79.iso"
+    sha256: null
+    verification:
+      # Boxer currently parses the signed SHA256.sig checksum payload but does
+      # not verify OpenBSD signify signatures. Keep this row checksum-bound
+      # over HTTPS until signify verification is added.
+      mode: checksum-manifest
+      checksum_url: "https://cdn.openbsd.org/pub/OpenBSD/7.9/amd64/SHA256.sig"
+      checksum_algorithm: sha256
+      checksum_filename: "install79.iso"
+    install:
+      method: manual
+    default_cpu: 2
+    default_ram_mb: 2048
+    default_disk_gb: 20
+
+  netbsd-10.1-boot:
+    type: iso
+    family: netbsd
+    refresh_policy: latest
+    description: "NetBSD 10.1 amd64 boot ISO"
+    url: "https://ftp.netbsd.org/pub/NetBSD/NetBSD-10.1/amd64/installation/cdrom/boot.iso"
+    sha256: null
+    verification:
+      mode: checksum-manifest
+      checksum_url: "https://ftp.netbsd.org/pub/NetBSD/NetBSD-10.1/amd64/installation/cdrom/SHA512"
+      checksum_algorithm: sha512
+      checksum_filename: "boot.iso"
+    install:
+      method: manual
+    default_cpu: 2
+    default_ram_mb: 1024
+    default_disk_gb: 20
+
+  # ------- Full installers (larger downloads; complete package sets) ---------
+
+  freebsd-14.3-disc1:
+    type: iso
+    family: freebsd
+    refresh_policy: latest
+    description: "FreeBSD 14.3 amd64 disc1 ISO (full installer)"
+    url: "https://download.freebsd.org/releases/ISO-IMAGES/14.3/FreeBSD-14.3-RELEASE-amd64-disc1.iso"
+    sha256: null
+    verification:
+      # Same CHECKSUM file as bootonly; contains entries for all 14.3 amd64 ISOs.
+      mode: checksum-manifest
+      checksum_url: "https://download.freebsd.org/releases/ISO-IMAGES/14.3/CHECKSUM.SHA256-FreeBSD-14.3-RELEASE-amd64"
+      checksum_algorithm: sha256
+      checksum_filename: "FreeBSD-14.3-RELEASE-amd64-disc1.iso"
+    install:
+      method: manual
+    default_cpu: 2
+    default_ram_mb: 2048
+    default_disk_gb: 30
+
+  netbsd-10.1-install:
+    type: iso
+    family: netbsd
+    refresh_policy: latest
+    description: "NetBSD 10.1 amd64 install CD ISO (full installer)"
+    url: "https://ftp.netbsd.org/pub/NetBSD/NetBSD-10.1/amd64/installation/cdrom/NetBSD-10.1-amd64.iso"
+    sha256: null
+    verification:
+      mode: checksum-manifest
+      checksum_url: "https://ftp.netbsd.org/pub/NetBSD/NetBSD-10.1/amd64/installation/cdrom/SHA512"
+      checksum_algorithm: sha512
+      checksum_filename: "NetBSD-10.1-amd64.iso"
+    install:
+      method: manual
+    default_cpu: 2
+    default_ram_mb: 2048
+    default_disk_gb: 20
+
+  # ------- Regression / older-release ISOs (manual refresh policy) ----------
+
+  freebsd-14.2-bootonly:
+    type: iso
+    family: freebsd
+    # manual: pin to this release and only re-fetch on explicit admin request.
+    refresh_policy: manual
+    description: "FreeBSD 14.2 amd64 bootonly ISO (regression)"
+    url: "https://download.freebsd.org/releases/ISO-IMAGES/14.2/FreeBSD-14.2-RELEASE-amd64-bootonly.iso"
+    sha256: null
+    verification:
+      mode: checksum-manifest
+      checksum_url: "https://download.freebsd.org/releases/ISO-IMAGES/14.2/CHECKSUM.SHA256-FreeBSD-14.2-RELEASE-amd64"
+      checksum_algorithm: sha256
+      checksum_filename: "FreeBSD-14.2-RELEASE-amd64-bootonly.iso"
+    install:
+      method: manual
+    default_cpu: 2
+    default_ram_mb: 2048
+    default_disk_gb: 20
+
+  openbsd-7.8-install:
+    type: iso
+    family: openbsd
+    refresh_policy: manual
+    description: "OpenBSD 7.8 amd64 install ISO (regression)"
+    url: "https://cdn.openbsd.org/pub/OpenBSD/7.8/amd64/install78.iso"
+    sha256: null
+    verification:
+      # SHA256.sig contains signify-signed digests; Boxer reads the checksum
+      # payload from the signed portion of the file (HTTPS-bound, no signify yet).
+      mode: checksum-manifest
+      checksum_url: "https://cdn.openbsd.org/pub/OpenBSD/7.8/amd64/SHA256.sig"
+      checksum_algorithm: sha256
+      checksum_filename: "install78.iso"
+    install:
+      method: manual
+    default_cpu: 2
+    default_ram_mb: 2048
+    default_disk_gb: 20
+
+  # Amazon Linux 2023 QEMU image.  The CDN path embeds a version-specific build
+  # timestamp, so admins must pin an explicit version.  Find the latest at:
+  #   https://cdn.amazonlinux.com/al2023/os-images/latest/kvm-stream/
+  # then uncomment and fill in {BUILD} (e.g. 2023.7.20260101.0):
+  #
+  # amazon-linux-2023:
+  #   type: cloud-image
+  #   family: amazon
+  #   refresh_policy: pinned
+  #   description: "Amazon Linux 2023 (pinned build {BUILD})"
+  #   url: "https://cdn.amazonlinux.com/al2023/os-images/{BUILD}/kvm-stream/al2023-kvm-{BUILD}-kernel-6.1-x86_64.xfs.gpt.qcow2"
+  #   sha256: null
+  #   verification:
+  #     mode: checksum-manifest
+  #     checksum_url: "https://cdn.amazonlinux.com/al2023/os-images/{BUILD}/kvm-stream/SHA256SUMS"
+  #     checksum_algorithm: sha256
+  #     checksum_filename: "al2023-kvm-{BUILD}-kernel-6.1-x86_64.xfs.gpt.qcow2"
+  #   default_cpu: 2
+  #   default_ram_mb: 2048
+  #   default_disk_gb: 20
+
   # Example unattended-install entry (admin-provided). Installer ISO URLs and
   # their SHA256SUMS/SHA256SUMS.gpg live on releases.ubuntu.com and are
   # point-release specific, so this is left commented for admins to pin:

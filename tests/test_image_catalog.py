@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 
 from boxer.config import BoxerConfig, ImageCatalog
 from boxer.ipc import IPCError, ERR_INVALID_PARAMS, ERR_INTERNAL
@@ -13,6 +14,8 @@ from boxerd.image_catalog import (
     _validate_url,
     _is_private_ip,
 )
+
+_IMAGES_YAML = Path(__file__).parent.parent / "config" / "images.yaml"
 
 
 def test_private_ip_detection() -> None:
@@ -82,6 +85,18 @@ SHA256 (Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2) = 8f6e5d4c3b2a19081726354
             "sha256",
         )
         == "8f6e5d4c3b2a19081726354433221100ffeeddccbbaa99887766554433221100"
+    )
+
+
+def test_parse_digest_only_sidecar_manifest() -> None:
+    digest = (
+        "05bd2071f54cb47307fd1f9ff99333b3426dafa7fea95253"
+        "b1100119b4da537e5f415c369a7c74b8c4d11cc22db178e2"
+        "6f39ecb27b7757edbe25d19a9944f061"
+    )
+    assert (
+        _parse_checksum_manifest(digest + "\n", "nocloud_alpine.qcow2", "sha512")
+        == digest
     )
 
 
@@ -199,3 +214,166 @@ def test_iso_and_image_caches_are_separate(tmp_path) -> None:
     # Content-addressed: digest in the filename, distinct extensions per kind.
     assert image_path.name == "sha256-abc.qcow2"
     assert iso_path.name == "sha256-abc.iso"
+
+
+# ------------------------------------------------ new checksum manifest formats
+
+
+def test_parse_centos_sha256sum_sidecar() -> None:
+    """CentOS Stream ships a per-file .SHA256SUM; bare hash on a single line."""
+    digest = "a" * 64
+    assert _parse_checksum_manifest(digest + "\n", "CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2", "sha256") == digest
+
+
+def test_parse_opensuse_sha256_filename_pair() -> None:
+    """openSUSE .sha256 files sometimes contain 'hash  filename'."""
+    digest = "b" * 64
+    text = f"{digest}  openSUSE-Leap-15.6-Minimal-VM.x86_64-Cloud.qcow2\n"
+    assert _parse_checksum_manifest(text, "openSUSE-Leap-15.6-Minimal-VM.x86_64-Cloud.qcow2", "sha256") == digest
+
+
+def test_parse_rocky_fedora_style_checksum() -> None:
+    """Rocky and AlmaLinux CHECKSUM files use 'SHA256 (file) = hash' Fedora style."""
+    digest = "c" * 64
+    text = f"SHA256 (Rocky-8-GenericCloud.latest.x86_64.qcow2) = {digest}\n"
+    assert _parse_checksum_manifest(text, "Rocky-8-GenericCloud.latest.x86_64.qcow2", "sha256") == digest
+
+
+def test_parse_freebsd_multi_entry_checksum() -> None:
+    """FreeBSD CHECKSUM files contain entries for multiple ISOs; match by filename."""
+    disc1_digest = "d" * 64
+    bootonly_digest = "e" * 64
+    text = (
+        f"SHA256 (FreeBSD-14.3-RELEASE-amd64-disc1.iso) = {disc1_digest}\n"
+        f"SHA256 (FreeBSD-14.3-RELEASE-amd64-bootonly.iso) = {bootonly_digest}\n"
+    )
+    assert _parse_checksum_manifest(text, "FreeBSD-14.3-RELEASE-amd64-disc1.iso", "sha256") == disc1_digest
+    assert _parse_checksum_manifest(text, "FreeBSD-14.3-RELEASE-amd64-bootonly.iso", "sha256") == bootonly_digest
+
+
+# -------------------------------------------------------- catalog integrity
+
+
+def test_images_yaml_loads_and_all_entries_have_required_fields() -> None:
+    """Every active entry in images.yaml must have url, type, and default resources."""
+    data = yaml.safe_load(_IMAGES_YAML.read_text())
+    images: dict = data.get("images", {})
+    assert images, "images.yaml contains no image entries"
+
+    for name, entry in images.items():
+        assert "url" in entry, f"{name}: missing url"
+        entry_type = entry.get("type") or entry.get("artifact_type")
+        assert entry_type in ("cloud-image", "iso"), f"{name}: unknown type {entry_type!r}"
+        assert "default_cpu" in entry, f"{name}: missing default_cpu"
+        assert "default_ram_mb" in entry, f"{name}: missing default_ram_mb"
+        assert "default_disk_gb" in entry, f"{name}: missing default_disk_gb"
+        assert "family" in entry, f"{name}: missing family"
+        url = entry["url"]
+        assert url.startswith("https://"), f"{name}: url must be https"
+
+
+def test_images_yaml_iso_entries_have_install_method() -> None:
+    data = yaml.safe_load(_IMAGES_YAML.read_text())
+    for name, entry in data.get("images", {}).items():
+        if entry.get("type") == "iso":
+            assert "install" in entry, f"{name}: iso entry missing install block"
+            assert "method" in entry["install"], f"{name}: iso install block missing method"
+
+
+def test_images_yaml_verification_algorithms_are_supported() -> None:
+    data = yaml.safe_load(_IMAGES_YAML.read_text())
+    supported = {"sha256", "sha512"}
+    for name, entry in data.get("images", {}).items():
+        verification = entry.get("verification") or {}
+        algo = verification.get("checksum_algorithm")
+        if algo is not None:
+            assert algo in supported, f"{name}: unsupported checksum_algorithm {algo!r}"
+
+
+def test_images_yaml_expected_families_present() -> None:
+    data = yaml.safe_load(_IMAGES_YAML.read_text())
+    families = {e.get("family") for e in data.get("images", {}).values()}
+    for expected in ("ubuntu", "debian", "fedora", "almalinux", "rocky", "alpine", "freebsd", "openbsd", "netbsd", "centos", "opensuse"):
+        assert expected in families, f"family '{expected}' not represented in catalog"
+
+
+# -------------------------------------------------------- DHCP lease fallback
+
+
+def test_dhcp_lease_fallback_returns_ip(monkeypatch) -> None:
+    """_get_ip_via_dhcp_lease extracts MAC/net from XML and queries DHCPLeases."""
+    import xml.etree.ElementTree as ET
+    from unittest.mock import MagicMock
+    from boxerd.vm_ops import VMOperations
+
+    domain_xml = """<domain>
+      <devices>
+        <interface type='network'>
+          <mac address='52:54:00:ab:cd:ef'/>
+          <source network='boxer-net-test'/>
+        </interface>
+      </devices>
+    </domain>"""
+
+    mock_dom = MagicMock()
+    mock_dom.XMLDesc.return_value = domain_xml
+
+    mock_net = MagicMock()
+    mock_net.DHCPLeases.return_value = [
+        {"type": 0, "ipaddr": "10.200.1.99", "mac": "52:54:00:ab:cd:ef"},
+    ]
+
+    mock_conn = MagicMock()
+    mock_conn.lookupByName.return_value = mock_dom
+    mock_conn.networkLookupByName.return_value = mock_net
+
+    ops = VMOperations.__new__(VMOperations)
+    ops._conn = mock_conn
+
+    ip = ops._get_ip_via_dhcp_lease("boxer--proj--vm-test--vm_abc123")
+    assert ip == "10.200.1.99"
+    mock_net.DHCPLeases.assert_called_once_with("52:54:00:ab:cd:ef", 0)
+
+
+def test_dhcp_lease_fallback_skips_ipv6(monkeypatch) -> None:
+    """_get_ip_via_dhcp_lease ignores IPv6 (type=1) entries."""
+    from unittest.mock import MagicMock
+    from boxerd.vm_ops import VMOperations
+
+    domain_xml = """<domain>
+      <devices>
+        <interface type='network'>
+          <mac address='52:54:00:11:22:33'/>
+          <source network='boxer-net'/>
+        </interface>
+      </devices>
+    </domain>"""
+
+    mock_dom = MagicMock()
+    mock_dom.XMLDesc.return_value = domain_xml
+    mock_net = MagicMock()
+    mock_net.DHCPLeases.return_value = [
+        {"type": 1, "ipaddr": "fe80::1", "mac": "52:54:00:11:22:33"},
+    ]
+    mock_conn = MagicMock()
+    mock_conn.lookupByName.return_value = mock_dom
+    mock_conn.networkLookupByName.return_value = mock_net
+
+    ops = VMOperations.__new__(VMOperations)
+    ops._conn = mock_conn
+
+    assert ops._get_ip_via_dhcp_lease("test-vm") is None
+
+
+def test_dhcp_lease_fallback_returns_none_on_exception() -> None:
+    """_get_ip_via_dhcp_lease swallows all exceptions and returns None."""
+    from unittest.mock import MagicMock
+    from boxerd.vm_ops import VMOperations
+
+    mock_conn = MagicMock()
+    mock_conn.lookupByName.side_effect = RuntimeError("libvirt gone")
+
+    ops = VMOperations.__new__(VMOperations)
+    ops._conn = mock_conn
+
+    assert ops._get_ip_via_dhcp_lease("test-vm") is None
