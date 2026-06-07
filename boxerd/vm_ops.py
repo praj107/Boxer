@@ -84,11 +84,16 @@ def _domain_xml(
 
     cdrom_section = ""
     if cloud_init_iso:
+        # Use virtio instead of SATA CDROM.  The systemd cloud-init-generator
+        # runs early (before udev/SATA enumeration is complete) and calls blkid
+        # to scan for a 'cidata'-labelled disk.  Virtio block devices are
+        # enumerated by the virtio_blk driver before AHCI completes, so the
+        # cidata label is visible to the generator on all guest distributions.
         cdrom_section = f"""
-    <disk type='file' device='cdrom'>
+    <disk type='file' device='disk'>
       <driver name='qemu' type='raw'/>
       <source file='{cloud_init_iso}'/>
-      <target dev='sdb' bus='sata'/>
+      <target dev='vdb' bus='virtio'/>
       <readonly/>
     </disk>"""
 
