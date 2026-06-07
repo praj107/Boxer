@@ -88,7 +88,7 @@ def _domain_xml(
     <disk type='file' device='cdrom'>
       <driver name='qemu' type='raw'/>
       <source file='{cloud_init_iso}'/>
-      <target dev='sdb' bus='sata'/>
+      <target dev='hdc' bus='ide'/>
       <readonly/>
     </disk>"""
 

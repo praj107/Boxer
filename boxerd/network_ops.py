@@ -50,8 +50,14 @@ class NetworkManager:
         base = ipaddress.ip_network(self._cfg.network_base_cidr)
         prefix = self._cfg.network_prefix_len
 
-        # Stable index derived from project_id to get a consistent subnet
-        project_index = int(project_id[2:10], 16) % (2 ** (prefix - base.prefixlen))
+        # Stable index derived from project_id to get a consistent subnet.
+        # Strip the leading "p_" prefix; fall back to hash for non-hex IDs
+        # (e.g. "p_unknown" used when caller_project_id is absent).
+        raw = project_id[2:10]
+        try:
+            project_index = int(raw, 16) % (2 ** (prefix - base.prefixlen))
+        except ValueError:
+            project_index = hash(project_id) % (2 ** (prefix - base.prefixlen))
 
         subnets = list(base.subnets(new_prefix=prefix))
         subnet = subnets[project_index % len(subnets)]

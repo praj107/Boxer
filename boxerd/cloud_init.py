@@ -66,7 +66,11 @@ def _render_user_data(hostname: str, options: CloudInitOptions) -> str:
         "groups": ["sudo", "wheel"],
         "shell": "/bin/sh",
         "sudo": "ALL=(ALL) NOPASSWD:ALL",
-        "lock_passwd": True,
+        # Use passwd: '*' (disabled, not locked) instead of lock_passwd:True.
+        # Alpine's PAM rejects key-auth for locked accounts (! prefix in shadow);
+        # '*' allows SSH key auth while keeping password login impossible.
+        "passwd": "*",
+        "lock_passwd": False,
     }
     if options.ssh_authorized_keys:
         user["ssh_authorized_keys"] = options.ssh_authorized_keys
