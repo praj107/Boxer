@@ -499,5 +499,80 @@ def adopt(domain: str, yes: bool) -> None:
     click.echo(f"Adopted '{domain}' → vm_id={result['vm_id']}")
 
 
+@cli.command("purge-ghost")
+@click.argument("vm_id")
+@click.option("--yes", is_flag=True, help="Skip confirmation prompt")
+def purge_ghost(vm_id: str, yes: bool) -> None:
+    """Remove a ghost DB record whose libvirt domain no longer exists."""
+    if not yes:
+        click.confirm(f"Purge ghost record {vm_id} from the database?", abort=True)
+    result = _run(_call("vm.purge_ghost", {"vm_id": vm_id}))
+    click.echo(f"Purged ghost record {result['vm_id']}")
+
+
+@cli.command("forward")
+@click.argument("vm_id_or_name")
+@click.argument("port_spec", metavar="[LOCAL_PORT:]REMOTE_PORT")
+@click.option("--bind", "bind_address", default="127.0.0.1", show_default=True,
+              help="Local address to bind the forwarded port on")
+def forward(vm_id_or_name: str, port_spec: str, bind_address: str) -> None:
+    """Forward a local port into a VM over SSH.
+
+    VM_ID_OR_NAME may be a vm_id (e.g. vm_abc123) or the VM's display name.
+    PORT_SPEC examples:  8080:80  (local 8080 → VM port 80),  3306  (same port both sides).
+
+    Press Ctrl-C to stop forwarding.
+    """
+    import subprocess as _subprocess
+
+    vms = _run(_call("vm.list", {"include_stale": False}))
+    vm = next(
+        (v for v in vms if v["vm_id"] == vm_id_or_name or v["display_name"] == vm_id_or_name),
+        None,
+    )
+    if vm is None:
+        raise click.ClickException(
+            f"No active VM found with id or display name '{vm_id_or_name}'"
+        )
+    if not vm.get("ip_address"):
+        raise click.ClickException(
+            f"VM {vm['vm_id']} ({vm['display_name']}) has no IP address yet; "
+            "wait for boot to complete (boxer start --wait-ip VM_ID)."
+        )
+
+    if ":" in port_spec:
+        local_port, remote_port = port_spec.split(":", 1)
+    else:
+        local_port = remote_port = port_spec
+
+    try:
+        ssh_info = _run(_call("vm.ssh_access", {"vm_id": vm["vm_id"], "create": True}))
+    except IPCError as exc:
+        raise click.ClickException(f"SSH access setup failed: {exc}") from exc
+
+    cmd = [
+        "ssh",
+        "-i", ssh_info["private_key_path"],
+        "-o", "IdentitiesOnly=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ExitOnForwardFailure=yes",
+        "-N",
+        "-L", f"{bind_address}:{local_port}:{vm['ip_address']}:{remote_port}",
+        f"boxer@{vm['ip_address']}",
+    ]
+
+    click.echo(
+        f"Forwarding {bind_address}:{local_port} → {vm['display_name']} "
+        f"({vm['ip_address']}):{remote_port}"
+    )
+    click.echo("Press Ctrl-C to stop.")
+    try:
+        _subprocess.run(cmd, check=True)
+    except _subprocess.CalledProcessError as exc:
+        raise click.ClickException(f"SSH exited with code {exc.returncode}") from exc
+    except KeyboardInterrupt:
+        pass
+
+
 if __name__ == "__main__":
     cli()

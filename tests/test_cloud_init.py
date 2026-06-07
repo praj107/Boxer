@@ -15,8 +15,10 @@ def _rendered(options: CloudInitOptions) -> dict:
 def test_render_includes_default_ssh_and_guest_agent_packages() -> None:
     data = _rendered(CloudInitOptions())
     assert data["packages"] == ["qemu-guest-agent", "openssh-server"]
-    assert "systemctl enable --now qemu-guest-agent || true" in data["runcmd"]
-    assert "systemctl enable --now ssh || systemctl enable --now sshd || true" in data["runcmd"]
+    assert any("qemu-guest-agent" in cmd for cmd in data["runcmd"])
+    assert any("rc-service qemu-guest-agent start" in cmd for cmd in data["runcmd"])
+    assert any("rc-service sshd start" in cmd for cmd in data["runcmd"])
+    assert any("systemctl enable --now ssh" in cmd for cmd in data["runcmd"])
 
 
 def test_render_includes_authorized_keys_and_bootstrap_inputs() -> None:

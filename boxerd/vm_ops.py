@@ -69,7 +69,10 @@ def _domain_xml(
     serial_log: Path,
 ) -> str:
     libvirt_uuid = _libvirt_uuid(name, vm_id)
-    display_section = ""
+    display_section = """
+  <video>
+    <model type='none'/>
+  </video>"""
     if not headless:
         display_section = """
   <graphics type='spice' port='-1' autoport='yes' listen='127.0.0.1'>
@@ -195,7 +198,10 @@ def _installer_domain_xml(
     if emulate_nvme:
         disk_shareable = "      <shareable/>\n"
 
-    display_section = ""
+    display_section = """
+  <video>
+    <model type='none'/>
+  </video>"""
     if not headless:
         display_section = """
   <graphics type='spice' port='-1' autoport='yes' listen='127.0.0.1'>

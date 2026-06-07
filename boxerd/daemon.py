@@ -999,6 +999,11 @@ class BoxerDaemon:
         await self._db.touch_vm(vm_id)
         d = _vm_to_dict(vm)
         d["live_state"] = self._vm_ops.get_state(vm.libvirt_name)
+        if not vm.ip_address and d["live_state"] == "running":
+            ip = await self._vm_ops.get_ip_via_guest_agent(vm.libvirt_name, timeout=3)
+            if ip:
+                await self._db.update_vm_ip(vm_id, ip)
+                d["ip_address"] = ip
         return d
 
     # ------------------------------------------------------------------ vm.start

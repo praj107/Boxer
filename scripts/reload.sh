@@ -54,6 +54,17 @@ fi
 echo "[reload] Reinstalling package…"
 "${VENV_DIR}/bin/pip" install --quiet --force-reinstall "${REPO_DIR}"
 
+# Sync config files that setup.sh installs but pip does not manage.
+CONFIG_DIR="/etc/boxer"
+for cfg_file in images.yaml boxer.yaml; do
+    src="${REPO_DIR}/config/${cfg_file}"
+    dst="${CONFIG_DIR}/${cfg_file}"
+    if [[ -f "${src}" && -f "${dst}" ]]; then
+        echo "[reload] Syncing config: ${cfg_file}"
+        install -m 0644 -o root -g root "${src}" "${dst}"
+    fi
+done
+
 if [[ -f "${REPO_DIR}/systemd/${SERVICE}.service" ]]; then
     echo "[reload] Installing systemd unit…"
     tmp_service=$(mktemp --tmpdir "$(basename "${SERVICE_FILE}").XXXXXX")

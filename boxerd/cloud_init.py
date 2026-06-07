@@ -51,19 +51,20 @@ def _dedupe(items: list[str]) -> list[str]:
 def _render_user_data(hostname: str, options: CloudInitOptions) -> str:
     packages = _dedupe(["qemu-guest-agent", "openssh-server", *options.packages])
     runcmd = [
-        "systemctl enable --now qemu-guest-agent || true",
+        # systemctl for systemd distros; rc-service fallback for Alpine/OpenRC.
+        "systemctl enable --now qemu-guest-agent 2>/dev/null || rc-service qemu-guest-agent start 2>/dev/null || true",
         # Ensure host keys exist before starting sshd; Debian cloud images
         # occasionally miss this on first boot when the package postinst races
         # with cloud-init's runcmd phase.
         "ssh-keygen -A 2>/dev/null || true",
-        "systemctl enable --now ssh || systemctl enable --now sshd || true",
+        "systemctl enable --now ssh 2>/dev/null || systemctl enable --now sshd 2>/dev/null || rc-service sshd start 2>/dev/null || true",
         *options.runcmd,
     ]
 
     user: dict[str, object] = {
         "name": "boxer",
-        "groups": ["sudo"],
-        "shell": "/bin/bash",
+        "groups": ["sudo", "wheel"],
+        "shell": "/bin/sh",
         "sudo": "ALL=(ALL) NOPASSWD:ALL",
         "lock_passwd": True,
     }
@@ -143,7 +144,7 @@ class CloudInitBuilder:
                     None,
                     lambda c=cmd: subprocess.run(
                         [c, "-output", str(dest), "-volid", "cidata",
-                         "-joliet", "-rock", str(user_data), str(meta_data)],
+                         "-rock", str(user_data), str(meta_data)],
                         check=True,
                         capture_output=True,
                     ),

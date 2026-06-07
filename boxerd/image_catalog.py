@@ -552,7 +552,15 @@ class ImageManager:
 
         manifest_text = manifest_bytes.decode("utf-8", "replace")
         if policy is not None and policy.mode == "clearsigned":
-            manifest_text = extract_clearsigned_payload(manifest_text)
+            try:
+                manifest_text = extract_clearsigned_payload(manifest_text)
+            except IPCError:
+                if policy.required:
+                    raise
+                logger.warning(
+                    "Manifest at %s is not PGP-clearsigned; proceeding with raw checksum text "
+                    "(signature not required)", checksum_url,
+                )
 
         digest = _parse_checksum_manifest(manifest_text, filename, algorithm)
         source = f"checksum manifest {checksum_url}"
