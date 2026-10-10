@@ -6,7 +6,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-from boxer.ipc import IPCError, make_request, read_message
+from boxer.ipc import MAX_MESSAGE_BYTES, IPCError, make_request, read_message
 
 
 class IPCClient:
@@ -17,7 +17,9 @@ class IPCClient:
         self._lock = asyncio.Lock()
 
     async def connect(self) -> None:
-        self._reader, self._writer = await asyncio.open_unix_connection(str(self._socket_path))
+        self._reader, self._writer = await asyncio.open_unix_connection(
+            str(self._socket_path), limit=MAX_MESSAGE_BYTES
+        )
 
     async def close(self) -> None:
         if self._writer:

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import logging
 import re
 import uuid
@@ -11,15 +13,21 @@ from typing import Any, Optional
 
 import libvirt
 
-from boxer.config import BoxerConfig, get_config
+from boxer.config import BoxerConfig, get_android_catalog, get_config
 from boxer.ipc import ERR_INVALID_PARAMS, ERR_NOT_FOUND, ERR_POLICY_VIOLATION, IPCError
 from boxer.types import VMRecord
+from boxerd.adb_ops import AdbOperations
+from boxerd.agent_inject import BOXERCTL_PROFILE, boxerctl_injection
+from boxerd.android_sdk import AndroidSDK
 from boxerd.cloud_init import CloudInitBuilder, WriteFile
 from boxerd.db import Database
+from boxerd.emulator_ops import EmulatorOperations, validate_avd_name
 from boxerd.guest_agent import GuestAgent
+from boxerd.guest_utils import GuestUtils
 from boxerd.image_catalog import ImageManager
 from boxerd.installer_seed import SUPPORTED_METHODS, InstallerSeedBuilder, SeedOptions
 from boxerd.ipc_server import IPCServer
+from boxerd.labs import build_lab_request, lab_payload, lab_status_payload, list_labs
 from boxerd.lease_manager import LeaseManager
 from boxerd.network_ops import NetworkManager
 from boxerd.policy import PolicyEngine, caller_from_params
@@ -113,13 +121,24 @@ def _bootstrap_from_params(params: dict[str, Any]) -> dict[str, list[str]]:
     profile_names = _string_list(
         params.get("profiles", bootstrap.get("profiles")), "profiles", max_items=MAX_PROFILES, max_len=32
     )
-    resolved = resolve_profiles(profile_names)
+    # The boxerctl profile is special: it injects the in-guest agent binary
+    # rather than packages/runcmd, so resolve it separately from the allowlist.
+    want_boxerctl = BOXERCTL_PROFILE in profile_names
+    allowlist_profiles = [p for p in profile_names if p != BOXERCTL_PROFILE]
+    resolved = resolve_profiles(allowlist_profiles)
     packages = _dedupe_keep_order([*resolved["packages"], *packages])
     commands = _dedupe_keep_order([*resolved["runcmd"], *commands])
     if len(packages) > 80:
         raise IPCError(ERR_INVALID_PARAMS, "Too many packages after profile expansion (max 80)")
 
     write_files, secret_count = _parse_file_injections(params, bootstrap)
+
+    if want_boxerctl:
+        injection = boxerctl_injection()
+        if injection is not None:
+            agent_file, agent_cmds = injection
+            write_files = [*write_files, agent_file]
+            commands = _dedupe_keep_order([*commands, *agent_cmds])
     if secret_count:
         # Best-effort: drop cloud-init's persisted copy of user-data after first
         # boot so injected secret material is not readable from the instance cache.
@@ -207,6 +226,30 @@ _PERMISSIONS_RE = re.compile(r"^0[0-7]{3}$")
 _MAX_FILE_BYTES = 256 * 1024
 _MAX_TOTAL_FILE_BYTES = 1024 * 1024
 
+# Runtime transfers (vm.push_files / vm.pull) ride one IPC message each; base64 inflates by 4/3,
+# so these stay well inside boxer.ipc.MAX_MESSAGE_BYTES.
+_MAX_PUSH_BYTES = 32 * 1024 * 1024
+_MAX_PUSH_FILES = 64
+_MAX_PULL_BYTES = 32 * 1024 * 1024
+_MAX_EXEC_TIMEOUT = 3600
+_MAX_WAIT_SSH_SECONDS = 600
+
+
+def _guest_abs_path(raw: Any, field: str) -> str:
+    if not isinstance(raw, str) or not raw.startswith("/") or len(raw) > 4096 or "\x00" in raw:
+        raise IPCError(ERR_INVALID_PARAMS, f"{field} must be an absolute guest path")
+    return raw
+
+
+def _bounded_int(raw: Any, field: str, default: int, lo: int, hi: int) -> int:
+    try:
+        value = int(raw if raw is not None else default)
+    except (TypeError, ValueError) as exc:
+        raise IPCError(ERR_INVALID_PARAMS, f"{field} must be an integer") from exc
+    if not lo <= value <= hi:
+        raise IPCError(ERR_INVALID_PARAMS, f"{field} must be between {lo} and {hi}")
+    return value
+
 
 def _parse_file_injections(
     params: dict[str, Any], bootstrap: dict[str, Any]
@@ -277,6 +320,10 @@ class BoxerDaemon:
         self._network: Optional[NetworkManager] = None
         self._vm_ops: Optional[VMOperations] = None
         self._guest: Optional[GuestAgent] = None
+        self._guest_utils: Optional[GuestUtils] = None
+        self._android_sdk: Optional[AndroidSDK] = None
+        self._emulator_ops: Optional[EmulatorOperations] = None
+        self._adb_ops: Optional[AdbOperations] = None
         self._capacity: Optional[HostCapacity] = None
         self._scheduler: Optional[Scheduler] = None
         self._lease_manager: Optional[LeaseManager] = None
@@ -297,11 +344,23 @@ class BoxerDaemon:
         self._network = NetworkManager(self._conn, self._cfg)
         self._vm_ops = VMOperations(self._conn, self._cfg)
         self._guest = GuestAgent(self._conn, self._cfg)
+        self._guest_utils = GuestUtils(self._guest)
+        self._android_sdk = AndroidSDK(self._cfg)
+        self._emulator_ops = EmulatorOperations(self._android_sdk, self._cfg)
+        self._adb_ops = AdbOperations(self._android_sdk)
         self._capacity = HostCapacity(self._conn, self._cfg)
         self._scheduler = Scheduler(
             self._db, self._capacity, self._create_vm_from_request, self._cfg
         )
-        self._lease_manager = LeaseManager(self._db, self._vm_ops, self._storage, self._cfg)
+        self._lease_manager = LeaseManager(
+            self._db,
+            self._vm_ops,
+            self._storage,
+            self._cfg,
+            guest=self._guest,
+            ssh_keys=self._ssh_keys,
+            emulator_ops=self._emulator_ops,
+        )
 
         self._storage.ensure_pool()
         self._register_handlers()
@@ -324,7 +383,9 @@ class BoxerDaemon:
         logger.info("BoxerD stopped")
 
     def _register_handlers(self) -> None:
-        reg = self._server.register
+        def reg(method: str, handler: Any) -> None:
+            self._server.register(method, self._with_project_activity(method, handler))
+
         reg("vm.request", self._h_vm_request)
         reg("vm.request_installer", self._h_vm_request_installer)
         reg("vm.list", self._h_vm_list)
@@ -337,11 +398,23 @@ class BoxerDaemon:
         reg("vm.extend_lease", self._h_vm_extend_lease)
         reg("vm.snapshot", self._h_vm_snapshot)
         reg("vm.exec", self._h_vm_exec)
+        reg("vm.push_files", self._h_vm_push_files)
+        reg("vm.pull", self._h_vm_pull)
         reg("vm.screenshot", self._h_vm_screenshot)
         reg("vm.input", self._h_vm_input)
         reg("vm.serial_log", self._h_vm_serial_log)
         reg("image.preflight", self._h_image_preflight)
         reg("profile.list", self._h_profile_list)
+        reg("lab.list", self._h_lab_list)
+        reg("lab.request", self._h_lab_request)
+        reg("lab.status", self._h_lab_status)
+        reg("android.list_images", self._h_android_list_images)
+        reg("android.request", self._h_android_request)
+        reg("android.adb", self._h_android_adb)
+        reg("guest.sysinfo", self._h_guest_sysinfo)
+        reg("guest.services", self._h_guest_services)
+        reg("guest.logs", self._h_guest_logs)
+        reg("guest.packages", self._h_guest_packages)
         reg("image.list", self._h_image_list)
         reg("image.prewarm", self._h_image_prewarm)
         reg("image.refresh", self._h_image_refresh)
@@ -356,6 +429,60 @@ class BoxerDaemon:
         reg("vm.purge_ghost", self._h_vm_purge_ghost)
 
         self._server.register_notify("event.poll", self._h_event_poll)
+
+    def _with_project_activity(self, method: str, handler: Any) -> Any:
+        async def wrapped(params: dict[str, Any]) -> Any:
+            caller = caller_from_params(params)
+            track_project = (
+                not caller.is_admin
+                and isinstance(caller.project_id, str)
+                and caller.project_id.startswith("p_")
+                and caller.project_id != "p_unknown"
+            )
+            if track_project:
+                await self._db.record_project_call(caller.project_id, method, caller.user)
+
+            try:
+                result = await handler(params)
+            except IPCError as exc:
+                if track_project:
+                    notices = await self._db.list_pending_project_notifications(caller.project_id, limit=5)
+                    if notices:
+                        notice_payloads = [self._notification_payload(note) for note in notices]
+                        data = dict(exc.data) if isinstance(exc.data, dict) else {}
+                        if exc.data is not None and not isinstance(exc.data, dict):
+                            data["error_data"] = exc.data
+                        data["boxer_notices"] = notice_payloads
+                        await self._db.mark_project_notifications_delivered([note.id for note in notices])
+                        raise IPCError(exc.code, exc.message, data) from exc
+                raise
+
+            if track_project and isinstance(result, dict):
+                notices = await self._db.list_pending_project_notifications(caller.project_id, limit=5)
+                if notices:
+                    result = dict(result)
+                    existing = result.get("boxer_notices")
+                    notice_payloads = [self._notification_payload(note) for note in notices]
+                    if isinstance(existing, list):
+                        result["boxer_notices"] = [*existing, *notice_payloads]
+                    else:
+                        result["boxer_notices"] = notice_payloads
+                    await self._db.mark_project_notifications_delivered([note.id for note in notices])
+
+            return result
+
+        return wrapped
+
+    @staticmethod
+    def _notification_payload(note: Any) -> dict[str, Any]:
+        return {
+            "notification_id": note.id,
+            "level": note.level,
+            "vm_id": note.vm_id,
+            "message": note.message,
+            "created_at": note.created_at.isoformat(),
+            "details": note.details,
+        }
 
     # ------------------------------------------------------------------ vm.request
 
@@ -495,8 +622,11 @@ class BoxerDaemon:
 
     async def _create_vm_from_request(self, request: dict[str, Any]) -> None:
         request = {**request, "return_ssh_private_key": False, "wait_install_seconds": 0}
-        if request.get("job_type") == "installer":
+        job_type = request.get("job_type")
+        if job_type == "installer":
             await self._h_vm_request_installer(request)
+        elif job_type == "android":
+            await self._h_android_request(request)
         else:
             await self._h_vm_request(request)
 
@@ -856,7 +986,7 @@ class BoxerDaemon:
             ssh_keys.append(key_material.public_key)
 
         ssh_pubkey = self._cfg.boxer_ssh_pubkey
-        cloud_init_iso = await self._cloud_init.build(
+        cloud_init_iso, configdrive_iso = await self._cloud_init.build(
             vm_id=vm_id,
             dest_dir=vm_dir,
             hostname=purpose[:20],
@@ -867,6 +997,7 @@ class BoxerDaemon:
             write_files=bootstrap.get("write_files") or [],
         )
         self._storage.prepare_readonly_file(cloud_init_iso)
+        self._storage.prepare_readonly_file(configdrive_iso)
 
         net_name = self._network.ensure_project_network(caller_project_id)
         serial_log = vm_dir / "serial.log"
@@ -883,6 +1014,7 @@ class BoxerDaemon:
                     ram_mb=ram_mb,
                     disk_path=overlay_path,
                     cloud_init_iso=cloud_init_iso,
+                    configdrive_iso=configdrive_iso,
                     net_name=net_name,
                     headless=headless,
                     serial_log=serial_log,
@@ -944,6 +1076,10 @@ class BoxerDaemon:
             await self._db.update_vm_ip(vm_id, ip)
             logger.info("VM %s got IP %s", vm_id, ip)
 
+    def _ops_for(self, vm: VMRecord):
+        """Backend dispatch: emulator backend for Android devices, else libvirt."""
+        return self._emulator_ops if vm.kind == "android" else self._vm_ops
+
     @staticmethod
     def _ssh_access_payload(
         vm: VMRecord,
@@ -979,7 +1115,7 @@ class BoxerDaemon:
             if not self._policy.check_vm_list_visibility(caller, vm):
                 continue
             d = _vm_to_dict(vm)
-            state = self._vm_ops.get_state(vm.libvirt_name)
+            state = self._ops_for(vm).get_state(vm.libvirt_name)
             d["live_state"] = state
             d["is_stale"] = vm.lease_until < datetime.now(timezone.utc)
             if not include_stale and d["is_stale"] and state == "stopped":
@@ -998,8 +1134,8 @@ class BoxerDaemon:
         self._policy.check("vm.get", caller, vm)
         await self._db.touch_vm(vm_id)
         d = _vm_to_dict(vm)
-        d["live_state"] = self._vm_ops.get_state(vm.libvirt_name)
-        if not vm.ip_address and d["live_state"] == "running":
+        d["live_state"] = self._ops_for(vm).get_state(vm.libvirt_name)
+        if vm.kind == "vm" and not vm.ip_address and d["live_state"] == "running":
             ip = await self._vm_ops.get_ip_via_guest_agent(vm.libvirt_name, timeout=3)
             if ip:
                 await self._db.update_vm_ip(vm_id, ip)
@@ -1018,9 +1154,11 @@ class BoxerDaemon:
         self._policy.check("vm.start", caller, vm)
 
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._vm_ops.start, vm.libvirt_name)
+        await loop.run_in_executor(None, self._ops_for(vm).start, vm.libvirt_name)
         await self._db.update_vm_state(vm_id, "running")
         vm.state = "running"
+        if vm.kind == "android":
+            return {"vm_id": vm_id, "state": "running", "ip_address": vm.ip_address}
         if wait_for_ip_seconds > 0:
             ip = await self._vm_ops.get_ip_via_guest_agent(
                 vm.libvirt_name,
@@ -1047,7 +1185,7 @@ class BoxerDaemon:
         self._policy.check("vm.stop", caller, vm)
 
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._vm_ops.stop, vm.libvirt_name, graceful)
+        await loop.run_in_executor(None, self._ops_for(vm).stop, vm.libvirt_name, graceful)
         await self._db.update_vm_state(vm_id, "stopped")
         return {"vm_id": vm_id, "state": "stopped"}
 
@@ -1064,11 +1202,14 @@ class BoxerDaemon:
         self._policy.check("vm.restart", caller, vm)
 
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._vm_ops.stop, vm.libvirt_name, graceful)
-        await loop.run_in_executor(None, self._vm_ops.start, vm.libvirt_name)
+        ops = self._ops_for(vm)
+        await loop.run_in_executor(None, ops.stop, vm.libvirt_name, graceful)
+        await loop.run_in_executor(None, ops.start, vm.libvirt_name)
         await self._db.update_vm_state(vm_id, "running")
         vm.state = "running"
 
+        if vm.kind == "android":
+            return {"vm_id": vm_id, "state": "running", "ip_address": vm.ip_address}
         if wait_for_ip_seconds > 0:
             ip = await self._vm_ops.get_ip_via_guest_agent(
                 vm.libvirt_name,
@@ -1141,12 +1282,12 @@ class BoxerDaemon:
 
         await self._db.update_vm_state(vm_id, "deleting")
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._vm_ops.undefine, vm.libvirt_name)
-        if vm.origin == "boxer":
+        await loop.run_in_executor(None, self._ops_for(vm).undefine, vm.libvirt_name)
+        if vm.kind == "vm" and vm.origin == "boxer":
             self._storage.delete_vm_storage(vm.project_id, vm_id)
         await self._db.delete_vm(vm_id)
 
-        if not self._network.has_active_vms(vm.project_id):
+        if vm.kind == "vm" and not self._network.has_active_vms(vm.project_id):
             vms_left = await self._db.list_vms(vm.project_id)
             if not vms_left:
                 self._network.teardown_project_network(vm.project_id)
@@ -1196,17 +1337,75 @@ class BoxerDaemon:
         caller = caller_from_params(params)
         vm_id = params.get("vm_id")
         command = params.get("command")
-        timeout = int(params.get("timeout_seconds", 30))
+        timeout = _bounded_int(params.get("timeout_seconds"), "timeout_seconds", 30, 1, _MAX_EXEC_TIMEOUT)
+        wait_ssh = _bounded_int(params.get("wait_ssh_seconds"), "wait_ssh_seconds", 0, 0, _MAX_WAIT_SSH_SECONDS)
+        detach = bool(params.get("detach", False))
         if not vm_id or not command:
             raise IPCError(ERR_INVALID_PARAMS, "vm_id and command required")
-        vm = await self._db.get_vm(vm_id)
-        self._policy.check("vm.exec", caller, vm)
-        if not vm.ip_address:
-            raise IPCError(ERR_INVALID_PARAMS, "VM has no IP address yet; wait for boot to complete")
-
-        result = await self._guest.exec_ssh(vm.ip_address, command, timeout)
+        vm, ephemeral_key = await self._guest_target(vm_id, caller, "vm.exec")
+        result = await self._guest.exec_ssh(
+            vm.ip_address, command, timeout, fallback_privkey_path=ephemeral_key,
+            detach=detach, wait_ssh_seconds=wait_ssh,
+        )
         await self._db.touch_vm(vm_id)
         return result
+
+    # ------------------------------------------------------------------ vm.push_files / vm.pull
+
+    async def _h_vm_push_files(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        vm_id = params.get("vm_id")
+        raw_files = params.get("files")
+        if not vm_id or not isinstance(raw_files, list) or not raw_files:
+            raise IPCError(ERR_INVALID_PARAMS, "vm_id and a non-empty files list required")
+        if len(raw_files) > _MAX_PUSH_FILES:
+            raise IPCError(ERR_INVALID_PARAMS, f"at most {_MAX_PUSH_FILES} files per push")
+        files: list[dict[str, Any]] = []
+        total = 0
+        for i, item in enumerate(raw_files):
+            if not isinstance(item, dict):
+                raise IPCError(ERR_INVALID_PARAMS, f"files[{i}] must be an object")
+            path = _guest_abs_path(item.get("path"), f"files[{i}].path")
+            try:
+                data = base64.b64decode(item.get("data_b64", ""), validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise IPCError(ERR_INVALID_PARAMS, f"files[{i}].data_b64 is not valid base64") from exc
+            total += len(data)
+            if total > _MAX_PUSH_BYTES:
+                raise IPCError(ERR_INVALID_PARAMS, f"push exceeds {_MAX_PUSH_BYTES} bytes")
+            mode = item.get("mode")
+            if mode is not None:
+                mode = _bounded_int(mode, f"files[{i}].mode", 0o644, 0, 0o7777)
+            files.append({"path": path, "data": data, "mode": mode, "extract": bool(item.get("extract", False))})
+        timeout = _bounded_int(params.get("timeout_seconds"), "timeout_seconds", 120, 1, _MAX_EXEC_TIMEOUT)
+        vm, ephemeral_key = await self._guest_target(vm_id, caller, "vm.push_files")
+        written = await self._guest.push_files(
+            vm.ip_address, files, timeout, fallback_privkey_path=ephemeral_key, sudo=bool(params.get("sudo", False)),
+        )
+        await self._db.touch_vm(vm_id)
+        return {"vm_id": vm_id, "files": written, "total_bytes": total}
+
+    async def _h_vm_pull(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        vm_id = params.get("vm_id")
+        if not vm_id:
+            raise IPCError(ERR_INVALID_PARAMS, "vm_id required")
+        path = _guest_abs_path(params.get("path"), "path")
+        max_bytes = _bounded_int(params.get("max_bytes"), "max_bytes", _MAX_PULL_BYTES, 1, _MAX_PULL_BYTES)
+        timeout = _bounded_int(params.get("timeout_seconds"), "timeout_seconds", 120, 1, _MAX_EXEC_TIMEOUT)
+        vm, ephemeral_key = await self._guest_target(vm_id, caller, "vm.pull")
+        result = await self._guest.pull_path(
+            vm.ip_address, path, max_bytes, timeout, fallback_privkey_path=ephemeral_key,
+            sudo=bool(params.get("sudo", False)),
+        )
+        await self._db.touch_vm(vm_id)
+        return {
+            "vm_id": vm_id,
+            "path": path,
+            "is_archive": result["is_archive"],
+            "bytes": len(result["data"]),
+            "data_b64": base64.b64encode(result["data"]).decode(),
+        }
 
     # ------------------------------------------------------------------ vm.screenshot
 
@@ -1285,6 +1484,302 @@ class BoxerDaemon:
 
     async def _h_profile_list(self, params: dict[str, Any]) -> dict[str, Any]:
         return {"profiles": available_profiles()}
+
+    # ------------------------------------------------------------------ lab.*
+
+    async def _h_lab_list(self, params: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "labs": list_labs(),
+            "constraints": {
+                "unit": "single-vm lab",
+                "capacity": "Requests use the same Boxer scheduler, per-project caps, leases, and queue as vm.request.",
+                "scope": "Labs are opinionated wrappers over Boxer VMs; they do not bypass catalog, network, or policy controls.",
+            },
+        }
+
+    async def _h_lab_request(self, params: dict[str, Any]) -> dict[str, Any]:
+        lab, request = build_lab_request(params)
+        passthrough = {
+            key: value
+            for key, value in params.items()
+            if key.startswith("caller_")
+        }
+        result = await self._h_vm_request({**passthrough, **request})
+        return lab_payload(lab, result)
+
+    async def _h_lab_status(self, params: dict[str, Any]) -> dict[str, Any]:
+        vm = await self._h_vm_get(params)
+        return lab_status_payload(vm)
+
+    # ------------------------------------------------------------------ android.*
+
+    async def _h_android_list_images(self, params: dict[str, Any]) -> dict[str, Any]:
+        catalog = get_android_catalog()
+        return {
+            "images": catalog.list_entries(),
+            "availability": self._android_sdk.availability(),
+            "note": (
+                "Automation defaults to google_apis/aosp_atd variants; "
+                "google_apis_playstore blocks adb root and is intentionally excluded."
+            ),
+        }
+
+    async def _h_android_request(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        caller_project_path = _caller_project_path(params, caller.project_id)
+        template = params.get("template")
+        purpose = params.get("purpose", "android")
+        ttl_minutes = int(params.get("ttl_minutes", max(self._cfg.default_ttl_minutes, 90)))
+        wait_boot_seconds = max(0, min(int(params.get("wait_boot_seconds", 0) or 0), 900))
+        tags = params.get("tags") or {}
+
+        catalog = get_android_catalog()
+        entry = catalog.get(template) if isinstance(template, str) else None
+        if entry is None:
+            raise IPCError(
+                ERR_INVALID_PARAMS,
+                f"Unknown Android image: {template}. Available: {catalog.list_names()}",
+            )
+        self._android_sdk.require_ready()
+
+        cores = int(params.get("cores") or entry.get("default_cores", 4))
+        ram_mb = int(params.get("ram_mb") or entry.get("default_ram_mb", 3072))
+        data_gb = int(params.get("data_gb") or entry.get("default_data_gb", 6))
+
+        # Resource admission via the shared scheduler, plus a dedicated emulator cap.
+        reason = await self._scheduler.check_admission(caller.project_id, cores, ram_mb, data_gb)
+        if not reason:
+            all_vms = await self._db.list_vms()
+            running_emulators = sum(
+                1
+                for v in all_vms
+                if v.kind == "android" and self._emulator_ops.get_state(v.libvirt_name) == "running"
+            )
+            if running_emulators >= self._cfg.max_concurrent_emulators:
+                reason = (
+                    f"Emulator concurrency limit reached "
+                    f"({running_emulators}/{self._cfg.max_concurrent_emulators})"
+                )
+        if reason:
+            queue_id = await self._scheduler.enqueue_request(
+                caller.project_id,
+                {
+                    **params,
+                    "job_type": "android",
+                    "cpu": cores,
+                    "ram_mb": ram_mb,
+                    "disk_gb": data_gb,
+                    "caller_project_id": caller.project_id,
+                    "caller_user": caller.user,
+                },
+                reason,
+            )
+            return {"status": "queued", "queue_id": queue_id, "reason": reason, "retry_after_seconds": 60}
+
+        vm_id = _make_vm_id()
+        avd_name = f"boxer_{vm_id}"
+        validate_avd_name(avd_name)
+        package_spec = entry["package"]
+        now = datetime.now(timezone.utc)
+        lease_until = now + timedelta(minutes=ttl_minutes)
+
+        await self._db.upsert_project(caller.project_id, caller_project_path)
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._android_sdk.ensure_system_image, package_spec)
+        await loop.run_in_executor(
+            None,
+            lambda: self._emulator_ops.create_avd(
+                avd_name, package_spec, device=str(entry.get("device", "pixel_6")), data_gb=data_gb
+            ),
+        )
+        launch = await loop.run_in_executor(
+            None, lambda: self._emulator_ops.launch(avd_name, ram_mb=ram_mb, cores=cores)
+        )
+        serial = str(launch["serial"])
+
+        device_tags = {
+            **{str(k): str(v) for k, v in tags.items() if not str(k).startswith("boxer.")},
+            "boxer.android.api": str(entry.get("api", "")),
+            "boxer.android.variant": str(entry.get("variant", "")),
+            "boxer.android.abi": str(entry.get("abi", "")),
+            "boxer.android.adb_serial": serial,
+            "boxer.android.console_port": str(launch["console_port"]),
+        }
+
+        vm = VMRecord(
+            id=vm_id,
+            libvirt_name=avd_name,
+            project_id=caller.project_id,
+            display_name=purpose,
+            state="running",
+            owner_user=caller.user,
+            template=template,
+            cpu=cores,
+            ram_mb=ram_mb,
+            disk_gb=data_gb,
+            headless=True,
+            created_at=now,
+            last_touched=now,
+            lease_until=lease_until,
+            ip_address=serial,
+            tags=device_tags,
+            artifact_type="android-emulator",
+            kind="android",
+        )
+        await self._db.insert_vm(vm)
+        await self._db.add_event(
+            "INFO",
+            f"Android device '{purpose}' ({vm_id}) booted on {template} by {caller.user}",
+            project_id=caller.project_id,
+            vm_id=vm_id,
+        )
+
+        result = _vm_to_dict(vm)
+        result["adb_serial"] = serial
+        if wait_boot_seconds > 0:
+            booted = await loop.run_in_executor(
+                None, lambda: self._emulator_ops.wait_boot(serial, wait_boot_seconds)
+            )
+            result["boot_completed"] = booted
+        return result
+
+    def _android_serial(self, vm: VMRecord) -> str:
+        serial = vm.tags.get("boxer.android.adb_serial") or vm.ip_address
+        if not serial:
+            raise IPCError(ERR_INVALID_PARAMS, "Android device has no adb serial yet")
+        return serial
+
+    async def _h_android_adb(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        vm_id = params.get("vm_id")
+        action = params.get("action")
+        if not vm_id or not action:
+            raise IPCError(ERR_INVALID_PARAMS, "vm_id and action are required")
+        vm = await self._db.get_vm(vm_id)
+        self._policy.check("android.adb", caller, vm)
+        if vm is None or vm.kind != "android":
+            raise IPCError(ERR_INVALID_PARAMS, "vm_id is not an Android device")
+        serial = self._android_serial(vm)
+        adb = self._adb_ops
+        loop = asyncio.get_running_loop()
+        await self._db.touch_vm(vm_id)
+
+        def _payload(data: Any) -> dict[str, Any]:
+            return {"vm_id": vm_id, "action": action, "result": data}
+
+        if action == "ui_dump":
+            return _payload(await loop.run_in_executor(None, lambda: adb.ui_dump(serial)))
+        if action == "tap":
+            await loop.run_in_executor(None, lambda: adb.tap(serial, int(params["x"]), int(params["y"])))
+            return _payload({"tapped": [params.get("x"), params.get("y")]})
+        if action == "swipe":
+            await loop.run_in_executor(
+                None,
+                lambda: adb.swipe(serial, int(params["x1"]), int(params["y1"]), int(params["x2"]), int(params["y2"]), int(params.get("ms", 300))),
+            )
+            return _payload({"swiped": True})
+        if action == "text":
+            await loop.run_in_executor(None, lambda: adb.text(serial, str(params.get("value", ""))))
+            return _payload({"typed": True})
+        if action == "key":
+            await loop.run_in_executor(None, lambda: adb.key(serial, str(params["keycode"])))
+            return _payload({"key": params.get("keycode")})
+        if action == "screenshot":
+            data = await loop.run_in_executor(None, lambda: adb.screenshot(serial))
+            return {"vm_id": vm_id, "action": action, "format": "png", "data": data}
+        if action == "install":
+            await loop.run_in_executor(None, lambda: adb.install_apk(serial, str(params["apk_path"])))
+            return _payload({"installed": params.get("apk_path")})
+        if action == "launch":
+            out = await loop.run_in_executor(
+                None, lambda: adb.launch(serial, str(params["package"]), params.get("activity"))
+            )
+            return _payload({"launched": params.get("package"), "output": out.strip()[:500]})
+        if action == "stop":
+            await loop.run_in_executor(None, lambda: adb.stop_app(serial, str(params["package"])))
+            return _payload({"stopped": params.get("package")})
+        if action == "clear":
+            await loop.run_in_executor(None, lambda: adb.clear_app(serial, str(params["package"])))
+            return _payload({"cleared": params.get("package")})
+        if action == "current_activity":
+            out = await loop.run_in_executor(None, lambda: adb.current_activity(serial))
+            return _payload({"dumpsys_tail": out.strip().splitlines()[-12:]})
+        if action == "logcat":
+            pid = None
+            if params.get("package"):
+                pid = await loop.run_in_executor(None, lambda: adb.pidof(serial, str(params["package"])))
+            records = await loop.run_in_executor(
+                None,
+                lambda: adb.logcat(
+                    serial,
+                    tag=params.get("tag"),
+                    priority=str(params.get("priority", "V")),
+                    package_pid=pid,
+                    limit=int(params.get("limit", 200)),
+                ),
+            )
+            return _payload(records)
+        if action == "instrument":
+            report = await loop.run_in_executor(
+                None,
+                lambda: adb.instrument(
+                    serial,
+                    str(params["test_package"]),
+                    runner=str(params.get("runner", "androidx.test.runner.AndroidJUnitRunner")),
+                    class_or_method=params.get("class"),
+                ),
+            )
+            return _payload(report)
+        if action == "pull":
+            await loop.run_in_executor(None, lambda: adb.pull(serial, str(params["remote"]), str(params["local"])))
+            return _payload({"pulled": params.get("remote")})
+        raise IPCError(ERR_INVALID_PARAMS, f"Unknown adb action: {action}")
+
+    # ------------------------------------------------------------------ guest.*
+
+    async def _guest_target(self, vm_id: Optional[str], caller, action: str):
+        if not vm_id:
+            raise IPCError(ERR_INVALID_PARAMS, "vm_id required")
+        vm = await self._db.get_vm(vm_id)
+        self._policy.check(action, caller, vm)
+        if vm.kind != "vm":
+            raise IPCError(ERR_INVALID_PARAMS, f"{action} is only supported on Linux VMs")
+        if not vm.ip_address:
+            raise IPCError(ERR_INVALID_PARAMS, "VM has no IP address yet; wait for boot to complete")
+        vm_dir = self._storage.vm_dir(vm.project_id, vm.id)
+        key = self._ssh_keys.key_path(vm_dir) if self._ssh_keys.has_key(vm_dir) else None
+        return vm, key
+
+    async def _h_guest_sysinfo(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        vm, key = await self._guest_target(params.get("vm_id"), caller, "guest.sysinfo")
+        data = await self._guest_utils.sysinfo(vm.ip_address, key)
+        await self._db.touch_vm(vm.id)
+        return {"vm_id": vm.id, "sysinfo": data}
+
+    async def _h_guest_services(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        vm, key = await self._guest_target(params.get("vm_id"), caller, "guest.services")
+        data = await self._guest_utils.services(vm.ip_address, key)
+        await self._db.touch_vm(vm.id)
+        return {"vm_id": vm.id, "services": data}
+
+    async def _h_guest_logs(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        vm, key = await self._guest_target(params.get("vm_id"), caller, "guest.logs")
+        data = await self._guest_utils.logs(vm.ip_address, key, lines=int(params.get("lines", 50) or 50))
+        await self._db.touch_vm(vm.id)
+        return {"vm_id": vm.id, "logs": data}
+
+    async def _h_guest_packages(self, params: dict[str, Any]) -> dict[str, Any]:
+        caller = caller_from_params(params)
+        vm, key = await self._guest_target(params.get("vm_id"), caller, "guest.packages")
+        data = await self._guest_utils.packages(
+            vm.ip_address, key, action=str(params.get("action", "query")), name=params.get("name")
+        )
+        await self._db.touch_vm(vm.id)
+        return {"vm_id": vm.id, "packages": data}
 
     # ------------------------------------------------------------------ image.list
 
@@ -1369,8 +1864,23 @@ class BoxerDaemon:
         now = datetime.now(timezone.utc)
         vms = await self._db.list_vms(None if caller.is_admin else caller.project_id)
         stale = [v for v in vms if v.lease_until < now]
+        pending_notices = (
+            []
+            if caller.is_admin
+            else [
+                self._notification_payload(note)
+                for note in await self._db.list_pending_project_notifications(caller.project_id, limit=20)
+            ]
+        )
         return {
             "stale_count": len(stale),
+            "cleanup_policy": {
+                "scan_interval_minutes": self._cfg.stale_cleanup_interval_minutes,
+                "inactive_call_window_minutes": self._cfg.inactive_call_window_minutes,
+                "inactive_call_threshold": self._cfg.inactive_call_threshold,
+                "force_shutdown_after_minutes": self._cfg.stale_force_shutdown_after_minutes,
+            },
+            "pending_cleanup_notices": pending_notices,
             "stale_vms": [
                 {
                     "vm_id": v.id,
@@ -1630,4 +2140,5 @@ def _vm_to_dict(vm: VMRecord) -> dict[str, Any]:
         "origin": vm.origin,
         "artifact_type": vm.artifact_type,
         "install_state": vm.install_state,
+        "kind": vm.kind,
     }

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import subprocess
 import tempfile
@@ -75,10 +76,32 @@ def _render_user_data(hostname: str, options: CloudInitOptions) -> str:
     if options.ssh_authorized_keys:
         user["ssh_authorized_keys"] = options.ssh_authorized_keys
 
+    # Explicit network config using netplan v2 syntax.  Cloud-init translates
+    # this to the renderer appropriate for the distro (NM on EL9, netplan on
+    # Ubuntu, ENI on Debian, etc.).  Matching both eth* and en* covers:
+    # - net.ifnames=0 kernels (Rocky 9 GenericCloud): NIC is "eth0"
+    # - predictable-name kernels (Debian/Ubuntu/AlmaLinux): NIC is "ens*"/"enp*"
+    network_config: dict[str, object] = {
+        "version": 2,
+        "ethernets": {
+            "all-eth": {
+                "match": {"name": "eth*"},
+                "dhcp4": True,
+                "dhcp6": False,
+                "set-name": "eth0",
+            },
+            "all-en": {
+                "match": {"name": "en*"},
+                "dhcp4": True,
+                "dhcp6": False,
+            },
+        },
+    }
     data: dict[str, object] = {
         "hostname": hostname,
         "manage_etc_hosts": True,
         "users": [user],
+        "network": network_config,
         "package_update": True,
         "packages": packages,
         "runcmd": runcmd,
@@ -97,6 +120,41 @@ def _render_user_data(hostname: str, options: CloudInitOptions) -> str:
     return "#cloud-config\n" + yaml.safe_dump(data, sort_keys=False)
 
 
+def _render_configdrive_files(
+    vm_id: str,
+    hostname: str,
+    user_data: str,
+    options: CloudInitOptions,
+) -> dict[str, str]:
+    """Return a mapping of path→content for an OpenStack ConfigDrive layout.
+
+    ConfigDrive is the native cloud-init datasource on RHEL-derivative images
+    (Rocky, AlmaLinux, CentOS Stream).  The disk must be labelled 'config-2'
+    and contain an openstack/latest/ directory tree.
+    """
+    meta = {
+        "uuid": vm_id,
+        "hostname": hostname,
+        "name": hostname,
+        "launch_index": 0,
+        "availability_zone": "nova",
+        "project_id": "boxer",
+        "public_keys": {
+            f"key-{i}": k
+            for i, k in enumerate(options.ssh_authorized_keys)
+        },
+    }
+    return {
+        "openstack/latest/meta_data.json": json.dumps(meta),
+        "openstack/latest/user_data": user_data,
+        "openstack/latest/vendor_data.json": "{}",
+        "openstack/2012-08-10/meta_data.json": json.dumps(meta),
+        "openstack/2012-08-10/user_data": user_data,
+        "openstack/2012-08-10/vendor_data.json": "{}",
+        "ec2/latest/meta-data.json": json.dumps({"instance-id": vm_id, "hostname": hostname}),
+    }
+
+
 class CloudInitBuilder:
     async def build(
         self,
@@ -108,39 +166,59 @@ class CloudInitBuilder:
         packages: Optional[list[str]] = None,
         runcmd: Optional[list[str]] = None,
         write_files: Optional[list[WriteFile]] = None,
-    ) -> Path:
-        iso_path = dest_dir / "cloud-init.iso"
-        if iso_path.exists():
-            return iso_path
+    ) -> tuple[Path, Path]:
+        """Build both seed ISOs and return (nocloud_iso, configdrive_iso).
+
+        Two ISOs are always created:
+        - cloud-init.iso   (label "cidata",    NoCloud format)   → /dev/vdb in VM
+        - configdrive.iso  (label "config-2",  ConfigDrive format) → /dev/vdc in VM
+
+        This dual-seed approach handles all major cloud-init distros:
+        - Ubuntu, Debian, Alpine: prefer NoCloud (cidata)
+        - RHEL, Rocky, AlmaLinux, CentOS: prefer ConfigDrive (config-2)
+        """
+        nocloud_iso = dest_dir / "cloud-init.iso"
+        configdrive_iso = dest_dir / "configdrive.iso"
 
         keys = []
         if ssh_pubkey:
             keys.append(ssh_pubkey)
         keys.extend(ssh_authorized_keys or [])
-        user_data = _render_user_data(
-            hostname,
-            CloudInitOptions(
-                ssh_authorized_keys=_dedupe(keys),
-                packages=packages or [],
-                runcmd=runcmd or [],
-                write_files=write_files or [],
-            ),
+        deduped_keys = _dedupe(keys)
+
+        opts = CloudInitOptions(
+            ssh_authorized_keys=deduped_keys,
+            packages=packages or [],
+            runcmd=runcmd or [],
+            write_files=write_files or [],
         )
+        user_data = _render_user_data(hostname, opts)
         meta_data = _META_DATA_TEMPLATE.format(vm_id=vm_id, hostname=hostname)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            ud = Path(tmpdir) / "user-data"
-            md = Path(tmpdir) / "meta-data"
-            ud.write_text(user_data)
-            md.write_text(meta_data)
-            await self._run_genisoimage(ud, md, iso_path)
+        if not nocloud_iso.exists():
+            with tempfile.TemporaryDirectory() as tmpdir:
+                ud = Path(tmpdir) / "user-data"
+                md = Path(tmpdir) / "meta-data"
+                ud.write_text(user_data)
+                md.write_text(meta_data)
+                await self._run_genisoimage_nocloud(ud, md, nocloud_iso)
+            logger.info("NoCloud ISO created at %s", nocloud_iso)
 
-        logger.info("cloud-init ISO created at %s", iso_path)
-        return iso_path
+        if not configdrive_iso.exists():
+            cd_files = _render_configdrive_files(vm_id, hostname, user_data, opts)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmppath = Path(tmpdir)
+                for rel, content in cd_files.items():
+                    dest = tmppath / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_text(content)
+                await self._run_genisoimage_configdrive(tmppath, configdrive_iso)
+            logger.info("ConfigDrive ISO created at %s", configdrive_iso)
+
+        return nocloud_iso, configdrive_iso
 
     @staticmethod
-    async def _run_genisoimage(user_data: Path, meta_data: Path, dest: Path) -> None:
-        # Try genisoimage first, fall back to mkisofs
+    async def _run_genisoimage_nocloud(user_data: Path, meta_data: Path, dest: Path) -> None:
         for cmd in ("genisoimage", "mkisofs"):
             try:
                 loop = asyncio.get_running_loop()
@@ -158,4 +236,27 @@ class CloudInitBuilder:
                 continue
             except subprocess.CalledProcessError as exc:
                 raise RuntimeError(f"{cmd} failed: {exc.stderr.decode()}") from exc
-        raise RuntimeError("Neither genisoimage nor mkisofs found; install one to use cloud-init")
+        raise RuntimeError("Neither genisoimage nor mkisofs found")
+
+    @staticmethod
+    async def _run_genisoimage_configdrive(src_dir: Path, dest: Path) -> None:
+        for cmd in ("genisoimage", "mkisofs"):
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    lambda c=cmd: subprocess.run(
+                        [c, "-output", str(dest), "-volid", "config-2",
+                         "-rock", "-joliet",
+                         "-full-iso9660-filenames",
+                         str(src_dir)],
+                        check=True,
+                        capture_output=True,
+                    ),
+                )
+                return
+            except FileNotFoundError:
+                continue
+            except subprocess.CalledProcessError as exc:
+                raise RuntimeError(f"{cmd} failed: {exc.stderr.decode()}") from exc
+        raise RuntimeError("Neither genisoimage nor mkisofs found")

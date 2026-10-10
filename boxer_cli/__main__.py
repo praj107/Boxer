@@ -162,6 +162,86 @@ def ssh_access(vm_id: str, show_private_key: bool, no_create: bool, timeout_seco
         click.echo(result["private_key"])
 
 
+def _guest_call(method: str, params: dict[str, Any]) -> Any:
+    """IPC call for guest commands: report daemon errors as a clean message, not a traceback."""
+    try:
+        return _run(_call(method, params))
+    except IPCError as exc:
+        raise click.ClickException(exc.message) from exc
+
+
+@cli.command("exec", context_settings={"ignore_unknown_options": True})
+@click.argument("vm_id")
+@click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
+@click.option("--timeout", "timeout_seconds", default=30, show_default=True, help="Seconds (max 3600)")
+@click.option("--detach", is_flag=True, help="Run in the background; print pid and log path")
+@click.option("--wait-ssh", "wait_ssh_seconds", default=0, show_default=True,
+              help="Retry the SSH connection this long (e.g. after a reboot)")
+def exec_cmd(vm_id: str, command: tuple[str, ...], timeout_seconds: int, detach: bool, wait_ssh_seconds: int) -> None:
+    """Run a shell command inside a VM:  boxer exec VM_ID -- uname -a"""
+    result = _guest_call("vm.exec", {
+        "vm_id": vm_id,
+        "command": " ".join(command),
+        "timeout_seconds": timeout_seconds,
+        "detach": detach,
+        "wait_ssh_seconds": wait_ssh_seconds,
+    })
+    if detach:
+        click.echo(f"pid: {result.get('pid')}  log: {result.get('log_path')}")
+        return
+    sys.stdout.write(result.get("stdout", ""))
+    sys.stderr.write(result.get("stderr", ""))
+    sys.exit(int(result.get("exit_code", 0)))
+
+
+@cli.command("push")
+@click.argument("vm_id")
+@click.argument("local_path", type=click.Path(exists=True))
+@click.argument("remote_path")
+@click.option("--sudo", is_flag=True, help="Write as root in the guest")
+@click.option("--timeout", "timeout_seconds", default=120, show_default=True)
+def push(vm_id: str, local_path: str, remote_path: str, sudo: bool, timeout_seconds: int) -> None:
+    """Copy a host file or directory into a VM (directories unpack INTO REMOTE_PATH)."""
+    from boxer.transfer import pack_local
+
+    result = _guest_call("vm.push_files", {
+        "vm_id": vm_id, "files": [pack_local(local_path, remote_path)],
+        "sudo": sudo, "timeout_seconds": timeout_seconds,
+    })
+    for f in result["files"]:
+        click.echo(f"{f['path']}: {f['bytes']} bytes{' (unpacked)' if f.get('extracted') else ''}")
+
+
+@cli.command("pull")
+@click.argument("vm_id")
+@click.argument("remote_path")
+@click.argument("local_path")
+@click.option("--sudo", is_flag=True, help="Read as root in the guest")
+@click.option("--overwrite", is_flag=True, help="Replace an existing local path")
+def pull(vm_id: str, remote_path: str, local_path: str, sudo: bool, overwrite: bool) -> None:
+    """Copy a file or directory out of a VM."""
+    from boxer.transfer import write_pull
+
+    result = _guest_call("vm.pull", {"vm_id": vm_id, "path": remote_path, "sudo": sudo})
+    try:
+        out = write_pull(result, local_path, overwrite)
+    except FileExistsError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"{out['local_path']}: {out['bytes']} bytes{' (archive unpacked)' if out['is_archive'] else ''}")
+
+
+@cli.command("screenshot")
+@click.argument("vm_id")
+@click.argument("local_path")
+def screenshot(vm_id: str, local_path: str) -> None:
+    """Save a headed VM's screen as a PNG."""
+    from boxer.transfer import save_png
+
+    result = _guest_call("vm.screenshot", {"vm_id": vm_id})
+    out = save_png(result["data"], local_path)
+    click.echo(f"{out['local_path']}: {out['width']}x{out['height']}")
+
+
 @cli.command("delete")
 @click.argument("vm_id")
 @click.option("--yes", is_flag=True, help="Skip confirmation")
@@ -264,6 +344,124 @@ def profiles(as_json: bool) -> None:
     for p in rows:
         click.echo(f"{p['name']:<10} {p['description']}")
         click.echo(f"           packages: {', '.join(p['packages'])}")
+
+
+def _print_labs(rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        click.echo("No lab recipes configured.")
+        return
+    click.echo(f"{'LAB':<16} {'TEMPLATE':<16} {'TTL':<6} NICHE")
+    click.echo("-" * 90)
+    for lab in rows:
+        click.echo(
+            f"{lab['name']:<16} {lab['default_template']:<16} "
+            f"{lab['ttl_minutes']:<6} {lab['niche']}"
+        )
+        click.echo(f"  profiles: {', '.join(lab.get('profiles') or ['-'])}")
+        click.echo(f"  templates: {', '.join(lab.get('recommended_templates') or [lab['default_template']])}")
+
+
+@cli.command("labs")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON")
+def labs(as_json: bool) -> None:
+    """List opinionated lab recipes."""
+    result = _run(_call("lab.list", {}))
+    rows = result.get("labs", [])
+    if as_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+    _print_labs(rows)
+
+
+@cli.group("lab")
+def lab_group() -> None:
+    """Request and inspect opinionated Boxer labs."""
+
+
+@lab_group.command("list")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON")
+def lab_list(as_json: bool) -> None:
+    """List opinionated lab recipes."""
+    result = _run(_call("lab.list", {}))
+    rows = result.get("labs", [])
+    if as_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+    _print_labs(rows)
+
+
+@lab_group.command("request")
+@click.argument("recipe")
+@click.option("--purpose", default=None, help="Short purpose/name for the lab VM")
+@click.option("--template", default=None, help="Catalog template override")
+@click.option("--size", type=click.Choice(["small", "default", "large"]), default="default", show_default=True)
+@click.option("--ttl", "ttl_minutes", default=None, type=int, help="Lease duration in minutes")
+@click.option("--no-wait", is_flag=True, help="Return immediately instead of waiting for recipe readiness")
+@click.option("--tag", "tags", multiple=True, help="Extra tag key=value; boxer.* keys are reserved")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON")
+def lab_request(
+    recipe: str,
+    purpose: Optional[str],
+    template: Optional[str],
+    size: str,
+    ttl_minutes: Optional[int],
+    no_wait: bool,
+    tags: tuple[str, ...],
+    as_json: bool,
+) -> None:
+    """Request a single-VM lab from a recipe."""
+    parsed_tags: dict[str, str] = {}
+    for tag in tags:
+        if "=" not in tag:
+            raise click.BadParameter(f"Invalid tag '{tag}'. Use key=value.")
+        key, value = tag.split("=", 1)
+        parsed_tags[key] = value
+
+    params: dict[str, Any] = {"lab": recipe, "size": size, "wait": not no_wait}
+    if purpose:
+        params["purpose"] = purpose
+    if template:
+        params["template"] = template
+    if ttl_minutes is not None:
+        params["ttl_minutes"] = ttl_minutes
+    if parsed_tags:
+        params["tags"] = parsed_tags
+
+    result = _run(_call("lab.request", params))
+    if as_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+    lab_info = result.get("lab", {})
+    status = result.get("status") or result.get("state") or "-"
+    vm_id = result.get("vm_id") or lab_info.get("vm_id") or "-"
+    click.echo(f"{lab_info.get('title', recipe)}: {status}  vm_id={vm_id}")
+    if result.get("ip_address"):
+        click.echo(f"ip: {result['ip_address']}")
+    if result.get("wait_results"):
+        click.echo("wait:")
+        for key, value in result["wait_results"].items():
+            click.echo(f"  {key}: {value}")
+    if lab_info.get("next_steps"):
+        click.echo("next:")
+        for step in lab_info["next_steps"]:
+            click.echo(f"  - {step}")
+
+
+@lab_group.command("status")
+@click.argument("vm_id")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON")
+def lab_status(vm_id: str, as_json: bool) -> None:
+    """Show lab-oriented status for a VM."""
+    result = _run(_call("lab.status", {"vm_id": vm_id}))
+    if as_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+    vm = result.get("vm", {})
+    lab_info = result.get("lab", {})
+    click.echo(f"{vm.get('vm_id', vm_id)}  lab={lab_info.get('name') or '-'}  ready={lab_info.get('ready')}")
+    click.echo(f"state={vm.get('live_state', vm.get('state', '-'))}  ip={vm.get('ip_address') or '-'}")
+    for step in lab_info.get("next_steps") or []:
+        click.echo(f"  - {step}")
 
 
 @cli.command("image-refresh")
@@ -572,6 +770,163 @@ def forward(vm_id_or_name: str, port_spec: str, bind_address: str) -> None:
         raise click.ClickException(f"SSH exited with code {exc.returncode}") from exc
     except KeyboardInterrupt:
         pass
+
+
+@cli.group("android")
+def android_group() -> None:
+    """Boot and control Android emulator devices for app testing."""
+
+
+@android_group.command("images")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON")
+def android_images(as_json: bool) -> None:
+    """List allowlisted Android system images and SDK availability."""
+    result = _run(_call("android.list_images", {}))
+    if as_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+    avail = result.get("availability", {})
+    click.echo(f"sdk: enabled={avail.get('enabled')} kvm={avail.get('kvm')} root={avail.get('sdk_root') or '-'}")
+    click.echo(f"{'NAME':<34} {'API':<5} {'VARIANT':<14} ABI")
+    click.echo("-" * 70)
+    for r in result.get("images", []):
+        click.echo(f"{r['name']:<34} {str(r.get('api','')):<5} {str(r.get('variant','')):<14} {r.get('abi','')}")
+
+
+@android_group.command("request")
+@click.argument("template")
+@click.option("--purpose", default="android", help="Short name/purpose for the device")
+@click.option("--cores", default=None, type=int)
+@click.option("--ram", "ram_mb", default=None, type=int, help="RAM in MiB")
+@click.option("--data", "data_gb", default=None, type=int, help="Userdata partition GiB")
+@click.option("--ttl", "ttl_minutes", default=90, type=int)
+@click.option("--wait-boot", "wait_boot_seconds", default=0, type=int, help="Block until booted (max 900)")
+@click.option("--json", "as_json", is_flag=True)
+def android_request(
+    template: str,
+    purpose: str,
+    cores: Optional[int],
+    ram_mb: Optional[int],
+    data_gb: Optional[int],
+    ttl_minutes: int,
+    wait_boot_seconds: int,
+    as_json: bool,
+) -> None:
+    """Boot an Android emulator device from a catalog image."""
+    params: dict[str, Any] = {"template": template, "purpose": purpose, "ttl_minutes": ttl_minutes}
+    if cores is not None:
+        params["cores"] = cores
+    if ram_mb is not None:
+        params["ram_mb"] = ram_mb
+    if data_gb is not None:
+        params["data_gb"] = data_gb
+    if wait_boot_seconds:
+        params["wait_boot_seconds"] = wait_boot_seconds
+    result = _run(_call("android.request", params))
+    if as_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+    if result.get("status") == "queued":
+        click.echo(f"queued: {result.get('reason')} (queue_id={result.get('queue_id')})")
+        return
+    click.echo(f"{purpose}: {result.get('state')}  vm_id={result.get('vm_id')}  adb={result.get('adb_serial')}")
+    if "boot_completed" in result:
+        click.echo(f"boot_completed: {result['boot_completed']}")
+
+
+@android_group.command("ui")
+@click.argument("vm_id")
+@click.argument("action", type=click.Choice(["dump", "tap", "swipe", "text", "key"]))
+@click.option("--x", type=int)
+@click.option("--y", type=int)
+@click.option("--x2", type=int)
+@click.option("--y2", type=int)
+@click.option("--value", default=None)
+@click.option("--keycode", default=None)
+def android_ui(vm_id, action, x, y, x2, y2, value, keycode) -> None:
+    """Drive the UI: dump tree, tap/swipe/text/key."""
+    params: dict[str, Any] = {"vm_id": vm_id, "action": "ui_dump" if action == "dump" else action}
+    if action == "tap":
+        params.update({"x": x, "y": y})
+    elif action == "swipe":
+        params.update({"x1": x, "y1": y, "x2": x2, "y2": y2})
+    elif action == "text":
+        params["value"] = value or ""
+    elif action == "key":
+        params["keycode"] = keycode
+    click.echo(json.dumps(_run(_call("android.adb", params)), indent=2))
+
+
+@android_group.command("app")
+@click.argument("vm_id")
+@click.argument("action", type=click.Choice(["install", "launch", "stop", "clear", "current_activity", "pull"]))
+@click.option("--package", default=None)
+@click.option("--activity", default=None)
+@click.option("--apk", "apk_path", default=None)
+@click.option("--remote", default=None)
+@click.option("--local", default=None)
+def android_app(vm_id, action, package, activity, apk_path, remote, local) -> None:
+    """Install/launch/stop/clear an app, read activity, or pull a file."""
+    params: dict[str, Any] = {"vm_id": vm_id, "action": action}
+    for key, val in (("package", package), ("activity", activity), ("apk_path", apk_path), ("remote", remote), ("local", local)):
+        if val is not None:
+            params[key] = val
+    click.echo(json.dumps(_run(_call("android.adb", params)), indent=2))
+
+
+@android_group.command("logcat")
+@click.argument("vm_id")
+@click.option("--tag", default=None)
+@click.option("--priority", default="V")
+@click.option("--package", default=None)
+@click.option("--limit", default=100, type=int)
+def android_logcat(vm_id, tag, priority, package, limit) -> None:
+    """Read structured logcat records."""
+    params: dict[str, Any] = {"vm_id": vm_id, "action": "logcat", "priority": priority, "limit": limit}
+    if tag:
+        params["tag"] = tag
+    if package:
+        params["package"] = package
+    click.echo(json.dumps(_run(_call("android.adb", params)), indent=2))
+
+
+@cli.group("guest")
+def guest_group() -> None:
+    """Structured, token-efficient guest introspection over SSH."""
+
+
+@guest_group.command("info")
+@click.argument("vm_id")
+def guest_info(vm_id: str) -> None:
+    """System snapshot: os/kernel/cpu/mem/disk/uptime."""
+    click.echo(json.dumps(_run(_call("guest.sysinfo", {"vm_id": vm_id})), indent=2))
+
+
+@guest_group.command("services")
+@click.argument("vm_id")
+def guest_services(vm_id: str) -> None:
+    """Running/failed services, listening ports, top processes."""
+    click.echo(json.dumps(_run(_call("guest.services", {"vm_id": vm_id})), indent=2))
+
+
+@guest_group.command("packages")
+@click.argument("vm_id")
+@click.option("--action", type=click.Choice(["query", "search", "install"]), default="query")
+@click.option("--name", default=None)
+def guest_packages(vm_id: str, action: str, name: Optional[str]) -> None:
+    """Distro-aware package query/search/install."""
+    params: dict[str, Any] = {"vm_id": vm_id, "action": action}
+    if name:
+        params["name"] = name
+    click.echo(json.dumps(_run(_call("guest.packages", params)), indent=2))
+
+
+@guest_group.command("logs")
+@click.argument("vm_id")
+@click.option("--lines", default=50, type=int)
+def guest_logs(vm_id: str, lines: int) -> None:
+    """Failed units, journal/syslog tail, dmesg tail."""
+    click.echo(json.dumps(_run(_call("guest.logs", {"vm_id": vm_id, "lines": lines})), indent=2))
 
 
 if __name__ == "__main__":

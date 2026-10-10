@@ -15,6 +15,10 @@ class IPCError(Exception):
         super().__init__(f"[{code}] {message}")
 
 
+# One JSON-RPC message per line. asyncio's default StreamReader limit (64 KiB) is too small for
+# screenshots and file transfers, so both ends of the socket use this limit instead.
+MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+
 # JSON-RPC error codes
 ERR_PARSE = -32700
 ERR_INVALID_REQUEST = -32600

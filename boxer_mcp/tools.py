@@ -1,22 +1,33 @@
 """MCP tool definitions for Boxer VM control."""
 from __future__ import annotations
 
-from typing import Annotated, Any, Optional
+import os
+from collections.abc import Callable
+from typing import Annotated, Any, Literal, Optional
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
+from boxer.transfer import pack_local, save_png, write_pull
+from boxer_mcp.profiles import MCPProfile, resolve_mcp_profile
 from boxer_mcp.server import ipc
 
-mcp = FastMCP("boxer", instructions="Boxer QEMU/KVM VM control plane. Use box_resource_status first to check capacity before requesting VMs.")
+ReadinessCondition = Literal["guest_agent", "ip", "ssh", "cloud_init", "package_install"]
+InstallMethod = Literal["manual", "ubuntu", "debian", "fedora", "rhel"]
+
+ToolFunction = Callable[..., Any]
+
+READONLY_TOOL = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
+MUTATING_TOOL = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True)
+IDEMPOTENT_MUTATION = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True)
+DESTRUCTIVE_TOOL = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True)
 
 
-@mcp.tool()
 async def box_resource_status() -> dict[str, Any]:
     """Return current host CPU, RAM capacity and running VM counts."""
     return await ipc("resource.status", {})
 
 
-@mcp.tool()
 async def box_list_images() -> list[dict[str, Any]]:
     """List available image/ISO templates with family, refresh policy, and local cache status.
 
@@ -28,7 +39,40 @@ async def box_list_images() -> list[dict[str, Any]]:
     return result["images"]
 
 
-@mcp.tool()
+async def box_list_labs() -> dict[str, Any]:
+    """List opinionated Boxer lab recipes for clean repro, distro smoke, Docker, web, and desktop work."""
+    return await ipc("lab.list", {})
+
+
+async def box_request_lab(
+    lab: Annotated[str, "Lab recipe name from box_list_labs, e.g. linux-repro, distro-smoke, docker-build, web-ui"],
+    purpose: Annotated[Optional[str], "Short purpose/name for the lab VM; defaults to the lab name"] = None,
+    template: Annotated[Optional[str], "Optional catalog template override from the lab's recommended_templates"] = None,
+    size: Annotated[Literal["small", "default", "large"], "Resource size preset for the lab VM"] = "default",
+    ttl_minutes: Annotated[Optional[int], "Lease duration in minutes; defaults to the lab recipe"] = None,
+    wait: Annotated[bool, "Wait for the lab recipe's readiness checks before returning when possible"] = True,
+    tags: Annotated[Optional[dict[str, str]], "Optional string tags; boxer.* keys are reserved"] = None,
+) -> dict[str, Any]:
+    """Request an opinionated single-VM lab instead of hand-selecting raw VM options."""
+    params: dict[str, Any] = {"lab": lab, "size": size, "wait": wait}
+    if purpose is not None:
+        params["purpose"] = purpose
+    if template is not None:
+        params["template"] = template
+    if ttl_minutes is not None:
+        params["ttl_minutes"] = ttl_minutes
+    if tags:
+        params["tags"] = tags
+    return await ipc("lab.request", params)
+
+
+async def box_lab_status(
+    vm_id: Annotated[str, "VM ID returned by box_request_lab"],
+) -> dict[str, Any]:
+    """Return lab-oriented status and next steps for a lab VM."""
+    return await ipc("lab.status", {"vm_id": vm_id})
+
+
 async def box_prewarm_image(
     template: Annotated[str, "Template name to fetch and verify into the host cache ahead of time"],
 ) -> dict[str, Any]:
@@ -40,7 +84,6 @@ async def box_prewarm_image(
     return await ipc("image.prewarm", {"template": template})
 
 
-@mcp.tool()
 async def box_request_vm(
     template: Annotated[str, "Cloud-image catalog name (e.g. ubuntu-24.04, debian-12, fedora-44). For local ISO files use box_request_installer(iso_path=...) instead."],
     purpose: Annotated[str, "Short name/purpose for the VM, used as hostname prefix"],
@@ -58,7 +101,7 @@ async def box_request_vm(
     ssh_access: Annotated[bool, "Generate and authorize a per-VM ephemeral SSH key"] = False,
     return_ssh_private_key: Annotated[bool, "Include the generated private key in the response; only use when direct SSH is required"] = False,
     wait_for_ip_seconds: Annotated[int, "Wait this many seconds for guest-agent IP discovery before returning"] = 0,
-    wait_for: Annotated[Optional[list[str]], "Readiness conditions to wait for before returning: guest_agent, ip, ssh, cloud_init, package_install."] = None,
+    wait_for: Annotated[Optional[list[ReadinessCondition]], "Readiness conditions to wait for before returning: guest_agent, ip, ssh, cloud_init, package_install."] = None,
     wait_command: Annotated[Optional[str], "A command that must exit 0 (polled until wait_timeout_seconds) before returning"] = None,
     wait_timeout_seconds: Annotated[int, "Max seconds to wait for wait_for/wait_command conditions (capped at 900)"] = 0,
     tags: Annotated[Optional[dict[str, str]], "Optional key-value tags"] = None,
@@ -105,19 +148,37 @@ async def box_request_vm(
     return await ipc("vm.request", params)
 
 
-@mcp.tool()
+async def box_request_vm_compact(
+    template: Annotated[str, "Cloud-image catalog name, e.g. ubuntu-24.04, debian-12, fedora-44"],
+    purpose: Annotated[str, "Short VM purpose/name, used as hostname prefix"],
+    profiles: Annotated[Optional[list[str]], "Optional bootstrap profiles: python, node, docker, browser, desktop"] = None,
+    headless: Annotated[bool, "True for CLI-only, False for SPICE display"] = True,
+    ttl_minutes: Annotated[int, "Lease duration in minutes before VM is marked stale"] = 60,
+    wait_for: Annotated[Optional[list[ReadinessCondition]], "Optional readiness waits: guest_agent, ip, ssh, cloud_init, package_install"] = None,
+    wait_timeout_seconds: Annotated[int, "Max seconds to wait for readiness conditions, capped by the daemon"] = 0,
+) -> dict[str, Any]:
+    """Request a cloud-image VM using the compact schema for stricter tool callers."""
+    params: dict[str, Any] = {"template": template, "purpose": purpose, "headless": headless, "ttl_minutes": ttl_minutes}
+    if profiles:
+        params["profiles"] = profiles
+    if wait_for:
+        params["wait_for"] = wait_for
+    if wait_timeout_seconds:
+        params["wait_timeout_seconds"] = wait_timeout_seconds
+    return await ipc("vm.request", params)
+
+
 async def box_list_profiles() -> list[dict[str, Any]]:
     """List the named bootstrap profiles available for box_request_vm (offline, read-only)."""
     result = await ipc("profile.list", {})
     return result["profiles"]
 
 
-@mcp.tool()
 async def box_request_installer(
     purpose: Annotated[str, "Short name/purpose for the VM, used as hostname prefix"],
     template: Annotated[Optional[str], "Catalog installer ISO template name (type: iso, e.g. arch-latest). Mutually exclusive with iso_path."] = None,
     iso_path: Annotated[Optional[str], "Absolute host path to a locally-built ISO file. If local_iso_dir is set in boxer.yaml, the path must resolve under it. Mutually exclusive with template."] = None,
-    install_method: Annotated[Optional[str], "Seed method when using iso_path: manual (default, headed SPICE or serial), ubuntu (autoinstall), debian (preseed), fedora or rhel (kickstart)"] = None,
+    install_method: Annotated[Optional[InstallMethod], "Seed method when using iso_path: manual (default, headed SPICE or serial), ubuntu (autoinstall), debian (preseed), fedora or rhel (kickstart)"] = None,
     headless: Annotated[Optional[bool], "True for serial-only (no SPICE display). Defaults True for iso_path, False for catalog manual installs. Valid for all unattended seed methods."] = None,
     ttl_minutes: Annotated[int, "Lease duration in minutes (installs default to a longer lease)"] = 180,
     cpu: Annotated[Optional[int], "Number of vCPUs (default from template or 2)"] = None,
@@ -168,7 +229,6 @@ async def box_request_installer(
     return await ipc("vm.request_installer", params)
 
 
-@mcp.tool()
 async def box_list_vms(
     include_stale: Annotated[bool, "Include stopped VMs with expired leases"] = False,
 ) -> list[dict[str, Any]]:
@@ -176,7 +236,6 @@ async def box_list_vms(
     return await ipc("vm.list", {"include_stale": include_stale})
 
 
-@mcp.tool()
 async def box_get_vm(
     vm_id: Annotated[str, "VM ID (e.g. vm_6d92e4)"],
 ) -> dict[str, Any]:
@@ -184,7 +243,6 @@ async def box_get_vm(
     return await ipc("vm.get", {"vm_id": vm_id})
 
 
-@mcp.tool()
 async def box_start_vm(
     vm_id: Annotated[str, "VM ID"],
     wait_for_ip_seconds: Annotated[int, "Wait this many seconds for guest-agent IP discovery before returning"] = 0,
@@ -193,7 +251,6 @@ async def box_start_vm(
     return await ipc("vm.start", {"vm_id": vm_id, "wait_for_ip_seconds": wait_for_ip_seconds})
 
 
-@mcp.tool()
 async def box_stop_vm(
     vm_id: Annotated[str, "VM ID"],
     graceful: Annotated[bool, "True to send shutdown signal, False to force off"] = True,
@@ -202,7 +259,6 @@ async def box_stop_vm(
     return await ipc("vm.stop", {"vm_id": vm_id, "graceful": graceful})
 
 
-@mcp.tool()
 async def box_restart_vm(
     vm_id: Annotated[str, "VM ID"],
     graceful: Annotated[bool, "True to request graceful shutdown before starting again"] = True,
@@ -215,7 +271,6 @@ async def box_restart_vm(
     )
 
 
-@mcp.tool()
 async def box_get_ssh_access(
     vm_id: Annotated[str, "VM ID"],
     include_private_key: Annotated[bool, "Include private key material in the response"] = False,
@@ -234,7 +289,6 @@ async def box_get_ssh_access(
     )
 
 
-@mcp.tool()
 async def box_delete_vm(
     vm_id: Annotated[str, "VM ID — must be exact ID, not display name"],
 ) -> dict[str, Any]:
@@ -242,7 +296,6 @@ async def box_delete_vm(
     return await ipc("vm.delete", {"vm_id": vm_id})
 
 
-@mcp.tool()
 async def box_extend_lease(
     vm_id: Annotated[str, "VM ID"],
     ttl_minutes: Annotated[int, "Additional minutes to add to the lease"] = 60,
@@ -251,7 +304,6 @@ async def box_extend_lease(
     return await ipc("vm.extend_lease", {"vm_id": vm_id, "ttl_minutes": ttl_minutes})
 
 
-@mcp.tool()
 async def box_snapshot(
     vm_id: Annotated[str, "VM ID"],
     label: Annotated[str, "Human-readable snapshot label"] = "snap",
@@ -260,25 +312,68 @@ async def box_snapshot(
     return await ipc("vm.snapshot", {"vm_id": vm_id, "label": label})
 
 
-@mcp.tool()
 async def box_exec(
     vm_id: Annotated[str, "VM ID"],
     command: Annotated[str, "Shell command to run inside the VM"],
-    timeout_seconds: Annotated[int, "Max execution time in seconds"] = 30,
+    timeout_seconds: Annotated[int, "Max execution time in seconds (max 3600)"] = 30,
+    detach: Annotated[bool, "Run in the background (own session, output to log_path) and return at once"] = False,
+    wait_ssh_seconds: Annotated[int, "Keep retrying the SSH connection this long, e.g. after a reboot (max 600)"] = 0,
 ) -> dict[str, Any]:
-    """Run a command inside a VM via SSH. Returns stdout, stderr, exit_code."""
-    return await ipc("vm.exec", {"vm_id": vm_id, "command": command, "timeout_seconds": timeout_seconds})
+    """Run a command inside a VM via SSH. Returns stdout, stderr, exit_code.
+
+    Use detach=True for long jobs or commands that start background processes (installers,
+    reboots, servers): the call returns immediately with pid and log_path; read the log with
+    box_exec or box_pull later. Use wait_ssh_seconds after restarting a guest.
+    """
+    return await ipc("vm.exec", {
+        "vm_id": vm_id,
+        "command": command,
+        "timeout_seconds": timeout_seconds,
+        "detach": detach,
+        "wait_ssh_seconds": wait_ssh_seconds,
+    })
 
 
-@mcp.tool()
+async def box_push(
+    vm_id: Annotated[str, "VM ID"],
+    local_path: Annotated[str, "File or directory on the host to copy"],
+    remote_path: Annotated[str, "Absolute guest path: the file to write, or the directory to unpack into"],
+    sudo: Annotated[bool, "Write as root (sudo -n) for system paths"] = False,
+    timeout_seconds: Annotated[int, "Max transfer time in seconds"] = 120,
+) -> dict[str, Any]:
+    """Copy a host file or directory into a VM (max 32 MiB). Directories are sent as one
+    archive and unpacked into remote_path; .git, __pycache__, node_modules, build caches skipped."""
+    item = pack_local(local_path, remote_path)
+    return await ipc("vm.push_files", {
+        "vm_id": vm_id, "files": [item], "sudo": sudo, "timeout_seconds": timeout_seconds,
+    })
+
+
+async def box_pull(
+    vm_id: Annotated[str, "VM ID"],
+    remote_path: Annotated[str, "Absolute guest path of a file or directory"],
+    local_path: Annotated[str, "Host path to write (a directory for guest directories)"],
+    overwrite: Annotated[bool, "Replace an existing local file / non-empty directory"] = False,
+    sudo: Annotated[bool, "Read as root (sudo -n), e.g. /var/log files"] = False,
+) -> dict[str, Any]:
+    """Copy a file or directory out of a VM to the host (max 32 MiB). Returns the local path
+    instead of the content, so large logs and artifacts do not flood the context."""
+    result = await ipc("vm.pull", {"vm_id": vm_id, "path": remote_path, "sudo": sudo})
+    return {"vm_id": vm_id, "remote_path": remote_path, **write_pull(result, local_path, overwrite)}
+
+
 async def box_screenshot(
     vm_id: Annotated[str, "VM ID"],
+    save_path: Annotated[Optional[str], "Write the PNG to this host path and return the path instead of base64"] = None,
 ) -> dict[str, Any]:
-    """Capture a screenshot of a headed VM. Returns base64-encoded PNG."""
-    return await ipc("vm.screenshot", {"vm_id": vm_id})
+    """Capture a screenshot of a headed VM. Returns base64-encoded PNG, or with save_path the
+    written file's path and dimensions (open it with an image-capable file reader)."""
+    result = await ipc("vm.screenshot", {"vm_id": vm_id})
+    if save_path:
+        return {"vm_id": vm_id, "format": "png", **save_png(result["data"], save_path)}
+    return result
 
 
-@mcp.tool()
 async def box_input(
     vm_id: Annotated[str, "VM ID"],
     actions: Annotated[list[dict[str, Any]], "List of input actions: {type: 'key'|'type', keys: [...]} or {type: 'type', text: '...'}"],
@@ -287,7 +382,6 @@ async def box_input(
     return await ipc("vm.input", {"vm_id": vm_id, "actions": actions})
 
 
-@mcp.tool()
 async def box_get_serial_log(
     vm_id: Annotated[str, "VM ID"],
     tail_lines: Annotated[int, "Number of lines to return from the end of the log (default 200, max 5000)"] = 200,
@@ -301,19 +395,16 @@ async def box_get_serial_log(
     return await ipc("vm.serial_log", {"vm_id": vm_id, "tail_lines": tail_lines})
 
 
-@mcp.tool()
 async def box_queue_status() -> dict[str, Any]:
     """Check the VM creation queue for the current project."""
     return await ipc("queue.status", {})
 
 
-@mcp.tool()
 async def box_cleanup_plan() -> dict[str, Any]:
     """List stale VMs that can be cleaned up in the current project."""
     return await ipc("cleanup.plan", {})
 
 
-@mcp.tool()
 async def box_scan_unmanaged() -> dict[str, Any]:
     """Scan for QEMU/KVM VMs not tracked by Boxer.
 
@@ -328,7 +419,6 @@ async def box_scan_unmanaged() -> dict[str, Any]:
     return await ipc("vm.scan", {})
 
 
-@mcp.tool()
 async def box_import_vm(
     libvirt_name: Annotated[str, "Exact libvirt domain name to import (from box_scan_unmanaged foreign_vms)"],
     display_name: Annotated[Optional[str], "Human-readable name; defaults to the domain name"] = None,
@@ -345,7 +435,6 @@ async def box_import_vm(
     return await ipc("vm.import", params)
 
 
-@mcp.tool()
 async def box_adopt_vm(
     libvirt_name: Annotated[str, "Boxer-- domain name to re-adopt (from box_scan_unmanaged orphaned_boxer)"],
 ) -> dict[str, Any]:
@@ -356,7 +445,6 @@ async def box_adopt_vm(
     return await ipc("vm.adopt", {"libvirt_name": libvirt_name})
 
 
-@mcp.tool()
 async def box_purge_ghost(
     vm_id: Annotated[str, "VM ID of the ghost DB record to remove (from box_scan_unmanaged ghost_records)"],
 ) -> dict[str, Any]:
@@ -365,3 +453,263 @@ async def box_purge_ghost(
     Fails safely if the domain still exists in libvirt — use box_delete_vm in that case.
     """
     return await ipc("vm.purge_ghost", {"vm_id": vm_id})
+
+
+async def box_list_android_images() -> dict[str, Any]:
+    """List allowlisted Android emulator system images and SDK availability (read-only)."""
+    return await ipc("android.list_images", {})
+
+
+async def box_request_android(
+    template: Annotated[str, "Android image name from box_list_android_images, e.g. android-35-google_apis-x86_64"],
+    purpose: Annotated[str, "Short name/purpose for the device"],
+    cores: Annotated[Optional[int], "vCPU cores for the emulator (default from catalog)"] = None,
+    ram_mb: Annotated[Optional[int], "RAM in MiB (default from catalog)"] = None,
+    data_gb: Annotated[Optional[int], "Userdata partition size in GiB (default from catalog)"] = None,
+    ttl_minutes: Annotated[int, "Lease duration in minutes"] = 90,
+    wait_boot_seconds: Annotated[int, "Block until sys.boot_completed or this many seconds (0=return immediately, max 900)"] = 0,
+    tags: Annotated[Optional[dict[str, str]], "Optional string tags; boxer.* keys are reserved"] = None,
+) -> dict[str, Any]:
+    """Boot an Android emulator device (host-direct, KVM-accelerated) for app testing.
+
+    Returns vm_id + adb_serial when booted, or queued status if the emulator
+    concurrency/resource limit is reached. Android devices appear in box_list_vms
+    and are deleted with box_delete_vm. Control them with box_android_* tools.
+    """
+    params: dict[str, Any] = {"template": template, "purpose": purpose, "ttl_minutes": ttl_minutes}
+    if cores is not None:
+        params["cores"] = cores
+    if ram_mb is not None:
+        params["ram_mb"] = ram_mb
+    if data_gb is not None:
+        params["data_gb"] = data_gb
+    if wait_boot_seconds:
+        params["wait_boot_seconds"] = wait_boot_seconds
+    if tags:
+        params["tags"] = tags
+    return await ipc("android.request", params)
+
+
+async def box_android_ui(
+    vm_id: Annotated[str, "Android device VM ID"],
+    action: Annotated[Literal["dump", "tap", "swipe", "text", "key"], "UIAutomator action"],
+    x: Annotated[Optional[int], "X coordinate (tap/swipe start)"] = None,
+    y: Annotated[Optional[int], "Y coordinate (tap/swipe start)"] = None,
+    x2: Annotated[Optional[int], "Swipe end X"] = None,
+    y2: Annotated[Optional[int], "Swipe end Y"] = None,
+    value: Annotated[Optional[str], "Text to type (action=text)"] = None,
+    keycode: Annotated[Optional[str], "Keycode/name, e.g. KEYCODE_BACK, KEYCODE_HOME (action=key)"] = None,
+) -> dict[str, Any]:
+    """Drive the Android UI: dump the view tree as compact JSON, or tap/swipe/type/key by coordinate."""
+    params: dict[str, Any] = {"vm_id": vm_id, "action": "ui_dump" if action == "dump" else action}
+    if action == "tap":
+        params.update({"x": x, "y": y})
+    elif action == "swipe":
+        params.update({"x1": x, "y1": y, "x2": x2, "y2": y2})
+    elif action == "text":
+        params["value"] = value or ""
+    elif action == "key":
+        params["keycode"] = keycode
+    return await ipc("android.adb", params)
+
+
+async def box_android_app(
+    vm_id: Annotated[str, "Android device VM ID"],
+    action: Annotated[Literal["install", "launch", "stop", "clear", "current_activity", "pull"], "App control action"],
+    package: Annotated[Optional[str], "App package name (launch/stop/clear)"] = None,
+    activity: Annotated[Optional[str], "Optional explicit activity for launch"] = None,
+    apk_path: Annotated[Optional[str], "Host path to APK (action=install)"] = None,
+    remote: Annotated[Optional[str], "Remote device path (action=pull)"] = None,
+    local: Annotated[Optional[str], "Local host destination (action=pull)"] = None,
+) -> dict[str, Any]:
+    """Install/launch/stop/clear an app, read the current activity, or pull a file."""
+    params: dict[str, Any] = {"vm_id": vm_id, "action": action}
+    for key, val in (("package", package), ("activity", activity), ("apk_path", apk_path), ("remote", remote), ("local", local)):
+        if val is not None:
+            params[key] = val
+    return await ipc("android.adb", params)
+
+
+async def box_android_screenshot(
+    vm_id: Annotated[str, "Android device VM ID"],
+) -> dict[str, Any]:
+    """Capture an Android device screenshot. Returns base64-encoded PNG."""
+    return await ipc("android.adb", {"vm_id": vm_id, "action": "screenshot"})
+
+
+async def box_android_logcat(
+    vm_id: Annotated[str, "Android device VM ID"],
+    tag: Annotated[Optional[str], "Filter to a single log tag"] = None,
+    priority: Annotated[str, "Minimum priority when filtering by tag: V/D/I/W/E/F"] = "V",
+    package: Annotated[Optional[str], "Filter to a running package's PID"] = None,
+    limit: Annotated[int, "Max records to return from the end"] = 200,
+) -> dict[str, Any]:
+    """Read structured logcat records (telemetry) from an Android device."""
+    params: dict[str, Any] = {"vm_id": vm_id, "action": "logcat", "priority": priority, "limit": limit}
+    if tag:
+        params["tag"] = tag
+    if package:
+        params["package"] = package
+    return await ipc("android.adb", params)
+
+
+async def box_run_instrumentation(
+    vm_id: Annotated[str, "Android device VM ID"],
+    test_package: Annotated[str, "Instrumentation test package id"],
+    runner: Annotated[str, "Instrumentation runner class"] = "androidx.test.runner.AndroidJUnitRunner",
+    test_class: Annotated[Optional[str], "Optional class or class#method to run"] = None,
+) -> dict[str, Any]:
+    """Run an instrumented (Espresso/UIAutomator) test suite and return structured pass/fail."""
+    params: dict[str, Any] = {"vm_id": vm_id, "action": "instrument", "test_package": test_package, "runner": runner}
+    if test_class:
+        params["class"] = test_class
+    return await ipc("android.adb", params)
+
+
+async def box_sysinfo(
+    vm_id: Annotated[str, "VM ID"],
+) -> dict[str, Any]:
+    """Structured system snapshot of a Linux VM (os/kernel/cpu/mem/disk/uptime) in one call."""
+    return await ipc("guest.sysinfo", {"vm_id": vm_id})
+
+
+async def box_services(
+    vm_id: Annotated[str, "VM ID"],
+) -> dict[str, Any]:
+    """Structured services/processes view: running & failed units, listening ports, top processes."""
+    return await ipc("guest.services", {"vm_id": vm_id})
+
+
+async def box_packages(
+    vm_id: Annotated[str, "VM ID"],
+    action: Annotated[Literal["query", "search", "install"], "query installed, search, or install (mutating)"] = "query",
+    name: Annotated[Optional[str], "Package name (required for search/install)"] = None,
+) -> dict[str, Any]:
+    """Distro-aware package interface (apt/dnf/apk/zypper/pacman). Install is policy-gated and mutating."""
+    params: dict[str, Any] = {"vm_id": vm_id, "action": action}
+    if name:
+        params["name"] = name
+    return await ipc("guest.packages", params)
+
+
+async def box_logs(
+    vm_id: Annotated[str, "VM ID"],
+    lines: Annotated[int, "Number of recent log lines per source (max 500)"] = 50,
+) -> dict[str, Any]:
+    """Structured guest logs & health: failed units, journal/syslog tail, dmesg tail."""
+    return await ipc("guest.logs", {"vm_id": vm_id, "lines": lines})
+
+
+TOOL_FUNCTIONS: dict[str, ToolFunction] = {
+    "box_resource_status": box_resource_status,
+    "box_list_labs": box_list_labs,
+    "box_request_lab": box_request_lab,
+    "box_lab_status": box_lab_status,
+    "box_list_images": box_list_images,
+    "box_prewarm_image": box_prewarm_image,
+    "box_request_vm": box_request_vm,
+    "box_list_profiles": box_list_profiles,
+    "box_request_installer": box_request_installer,
+    "box_list_vms": box_list_vms,
+    "box_get_vm": box_get_vm,
+    "box_start_vm": box_start_vm,
+    "box_stop_vm": box_stop_vm,
+    "box_restart_vm": box_restart_vm,
+    "box_get_ssh_access": box_get_ssh_access,
+    "box_delete_vm": box_delete_vm,
+    "box_extend_lease": box_extend_lease,
+    "box_snapshot": box_snapshot,
+    "box_exec": box_exec,
+    "box_push": box_push,
+    "box_pull": box_pull,
+    "box_screenshot": box_screenshot,
+    "box_input": box_input,
+    "box_get_serial_log": box_get_serial_log,
+    "box_queue_status": box_queue_status,
+    "box_cleanup_plan": box_cleanup_plan,
+    "box_scan_unmanaged": box_scan_unmanaged,
+    "box_import_vm": box_import_vm,
+    "box_adopt_vm": box_adopt_vm,
+    "box_purge_ghost": box_purge_ghost,
+    "box_list_android_images": box_list_android_images,
+    "box_request_android": box_request_android,
+    "box_android_ui": box_android_ui,
+    "box_android_app": box_android_app,
+    "box_android_screenshot": box_android_screenshot,
+    "box_android_logcat": box_android_logcat,
+    "box_run_instrumentation": box_run_instrumentation,
+    "box_sysinfo": box_sysinfo,
+    "box_services": box_services,
+    "box_packages": box_packages,
+    "box_logs": box_logs,
+}
+
+COMPACT_TOOL_FUNCTIONS: dict[str, ToolFunction] = {
+    **TOOL_FUNCTIONS,
+    "box_request_vm": box_request_vm_compact,
+}
+
+TOOL_ANNOTATIONS: dict[str, ToolAnnotations] = {
+    "box_resource_status": READONLY_TOOL,
+    "box_list_labs": READONLY_TOOL,
+    "box_lab_status": READONLY_TOOL,
+    "box_list_images": READONLY_TOOL,
+    "box_list_profiles": READONLY_TOOL,
+    "box_list_vms": READONLY_TOOL,
+    "box_get_vm": READONLY_TOOL,
+    "box_screenshot": READONLY_TOOL,
+    "box_get_serial_log": READONLY_TOOL,
+    "box_queue_status": READONLY_TOOL,
+    "box_cleanup_plan": READONLY_TOOL,
+    "box_scan_unmanaged": READONLY_TOOL,
+    "box_list_android_images": READONLY_TOOL,
+    "box_android_screenshot": READONLY_TOOL,
+    "box_sysinfo": READONLY_TOOL,
+    "box_services": READONLY_TOOL,
+    "box_logs": READONLY_TOOL,
+    "box_prewarm_image": IDEMPOTENT_MUTATION,
+    "box_stop_vm": IDEMPOTENT_MUTATION,
+    "box_get_ssh_access": IDEMPOTENT_MUTATION,
+    "box_extend_lease": IDEMPOTENT_MUTATION,
+    "box_purge_ghost": DESTRUCTIVE_TOOL,
+    "box_delete_vm": DESTRUCTIVE_TOOL,
+    "box_request_vm": MUTATING_TOOL,
+    "box_request_lab": MUTATING_TOOL,
+    "box_request_installer": MUTATING_TOOL,
+    "box_start_vm": MUTATING_TOOL,
+    "box_restart_vm": MUTATING_TOOL,
+    "box_snapshot": MUTATING_TOOL,
+    "box_exec": MUTATING_TOOL,
+    "box_push": MUTATING_TOOL,
+    "box_pull": MUTATING_TOOL,
+    "box_input": MUTATING_TOOL,
+    "box_import_vm": MUTATING_TOOL,
+    "box_adopt_vm": MUTATING_TOOL,
+    "box_request_android": MUTATING_TOOL,
+    "box_android_ui": MUTATING_TOOL,
+    "box_android_app": MUTATING_TOOL,
+    "box_android_logcat": READONLY_TOOL,
+    "box_run_instrumentation": MUTATING_TOOL,
+    "box_packages": MUTATING_TOOL,
+}
+
+
+def build_mcp(profile_name: str | None = None) -> FastMCP:
+    """Build a Boxer MCP server for the requested operating profile."""
+    profile: MCPProfile = resolve_mcp_profile(profile_name)
+    server = FastMCP("boxer", instructions=profile.instructions)
+    functions = COMPACT_TOOL_FUNCTIONS if profile.compact_request_vm else TOOL_FUNCTIONS
+    for tool_name in profile.tool_names:
+        server.add_tool(
+            functions[tool_name],
+            name=tool_name,
+            annotations=TOOL_ANNOTATIONS.get(tool_name),
+        )
+    return server
+
+
+def default_profile_name() -> str:
+    return os.environ.get("BOXER_MCP_PROFILE", "codex")
+
+
+mcp = build_mcp(default_profile_name())

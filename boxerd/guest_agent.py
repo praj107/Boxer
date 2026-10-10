@@ -7,6 +7,7 @@ import logging
 import shlex
 import subprocess
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -68,42 +69,169 @@ class GuestAgent:
         except Exception as exc:
             raise IPCError(ERR_INTERNAL, f"Failed to convert screenshot: {exc}") from exc
 
-    async def exec_ssh(
-        self,
-        ip_address: str,
-        command: str,
-        timeout_seconds: int = 30,
-    ) -> dict[str, Any]:
+    # ------------------------------------------------------------------ SSH plumbing
+
+    def _resolve_privkey(self, fallback_privkey_path: Optional[Path]) -> Path:
         privkey_path = self._cfg.boxer_ssh_privkey_path
+        if (not privkey_path or not privkey_path.exists()) and fallback_privkey_path and fallback_privkey_path.exists():
+            privkey_path = fallback_privkey_path
         if not privkey_path or not privkey_path.exists():
             raise IPCError(ERR_INVALID_PARAMS, "No SSH private key configured (boxer_ssh_privkey_path)")
+        return privkey_path
 
+    async def _connect(
+        self,
+        ip_address: str,
+        timeout_seconds: int,
+        fallback_privkey_path: Optional[Path] = None,
+        wait_ssh_seconds: int = 0,
+    ) -> Any:
+        """Open an SSH connection, retrying for up to wait_ssh_seconds (e.g. across a reboot)."""
+        privkey_path = self._resolve_privkey(fallback_privkey_path)
         try:
             import asyncssh
         except ImportError:
             raise IPCError(ERR_INTERNAL, "asyncssh not installed")
 
-        try:
-            async with asyncssh.connect(
-                ip_address,
-                username="boxer",
-                client_keys=[str(privkey_path)],
-                known_hosts=None,
-                connect_timeout=timeout_seconds,
-            ) as conn:
-                result = await asyncio.wait_for(
-                    conn.run(command, check=False),
-                    timeout=timeout_seconds,
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0, wait_ssh_seconds)
+        while True:
+            try:
+                return await asyncssh.connect(
+                    ip_address,
+                    username="boxer",
+                    client_keys=[str(privkey_path)],
+                    known_hosts=None,
+                    connect_timeout=timeout_seconds,
                 )
-                return {
-                    "stdout": result.stdout or "",
-                    "stderr": result.stderr or "",
-                    "exit_code": result.exit_status or 0,
-                }
+            except (OSError, asyncssh.Error, asyncio.TimeoutError) as exc:
+                if loop.time() >= deadline:
+                    raise IPCError(ERR_INTERNAL, f"SSH connect failed: {exc}") from exc
+                await asyncio.sleep(2)
+
+    async def exec_ssh(
+        self,
+        ip_address: str,
+        command: str,
+        timeout_seconds: int = 30,
+        fallback_privkey_path: Optional[Path] = None,
+        detach: bool = False,
+        wait_ssh_seconds: int = 0,
+    ) -> dict[str, Any]:
+        """Run a command. With detach=True the command keeps running in its own session after
+        the call returns (stdin/stdout/stderr detached, output in log_path), so long jobs and
+        commands that background children no longer hold the SSH channel open until timeout."""
+        log_path = ""
+        if detach:
+            log_path = f"/tmp/boxer-job-{uuid.uuid4().hex[:12]}.log"
+            command = (
+                f"setsid nohup sh -c {shlex.quote(command)} > {log_path} 2>&1 < /dev/null & echo $!"
+            )
+        conn = await self._connect(ip_address, timeout_seconds, fallback_privkey_path, wait_ssh_seconds)
+        try:
+            async with conn:
+                result = await asyncio.wait_for(conn.run(command, check=False), timeout=timeout_seconds)
         except asyncio.TimeoutError:
             raise IPCError(ERR_INTERNAL, f"SSH exec timed out after {timeout_seconds}s")
+        except IPCError:
+            raise
         except Exception as exc:
             raise IPCError(ERR_INTERNAL, f"SSH exec failed: {exc}") from exc
+        out: dict[str, Any] = {
+            "stdout": result.stdout or "",
+            "stderr": result.stderr or "",
+            "exit_code": result.exit_status or 0,
+        }
+        if detach:
+            out["detached"] = True
+            out["pid"] = (result.stdout or "").strip()
+            out["log_path"] = log_path
+        return out
+
+    # ------------------------------------------------------------------ file transfer
+
+    async def push_files(
+        self,
+        ip_address: str,
+        files: list[dict[str, Any]],
+        timeout_seconds: int = 120,
+        fallback_privkey_path: Optional[Path] = None,
+        sudo: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Write files into the guest over the existing SSH channel (no scp/sftp dependency).
+
+        Each item: {"path": absolute guest path, "data": bytes, "mode": int|None,
+        "extract": bool}. With extract=True, data is a .tar.gz unpacked into path (a directory).
+        """
+        prefix = "sudo -n " if sudo else ""
+        written: list[dict[str, Any]] = []
+        conn = await self._connect(ip_address, timeout_seconds, fallback_privkey_path)
+        try:
+            async with conn:
+                for item in files:
+                    dest = item["path"]
+                    q = shlex.quote(dest)
+                    if item.get("extract"):
+                        tmp = f"/tmp/boxer-push-{uuid.uuid4().hex[:12]}.tgz"
+                        cmd = (
+                            f"cat > {tmp} && {prefix}mkdir -p {q} && "
+                            f"{prefix}tar -xzf {tmp} -C {q}; rc=$?; rm -f {tmp}; exit $rc"
+                        )
+                    else:
+                        cmd = f"{prefix}mkdir -p $(dirname {q}) && {prefix}tee {q} > /dev/null"
+                        if item.get("mode") is not None:
+                            cmd += f" && {prefix}chmod {int(item['mode']):o} {q}"
+                    result = await asyncio.wait_for(
+                        conn.run(cmd, input=item["data"], encoding=None, check=False),
+                        timeout=timeout_seconds,
+                    )
+                    if result.exit_status:
+                        err = (result.stderr or b"").decode(errors="replace").strip()
+                        raise IPCError(ERR_INTERNAL, f"push to {dest} failed: {err or result.exit_status}")
+                    written.append({"path": dest, "bytes": len(item["data"]), "extracted": bool(item.get("extract"))})
+        except asyncio.TimeoutError:
+            raise IPCError(ERR_INTERNAL, f"push timed out after {timeout_seconds}s")
+        except IPCError:
+            raise
+        except Exception as exc:
+            raise IPCError(ERR_INTERNAL, f"push failed: {exc}") from exc
+        return written
+
+    async def pull_path(
+        self,
+        ip_address: str,
+        path: str,
+        max_bytes: int,
+        timeout_seconds: int = 120,
+        fallback_privkey_path: Optional[Path] = None,
+        sudo: bool = False,
+    ) -> dict[str, Any]:
+        """Read a guest file, or a directory as .tar.gz, capped at max_bytes."""
+        prefix = "sudo -n " if sudo else ""
+        q = shlex.quote(path)
+        cmd = (
+            f"if {prefix}test -d {q}; then echo D; {prefix}tar -czf - -C {q} . | head -c {max_bytes + 1}; "
+            f"elif {prefix}test -f {q}; then echo F; {prefix}head -c {max_bytes + 1} {q}; "
+            f"else echo 'no such file or directory' >&2; exit 2; fi"
+        )
+        conn = await self._connect(ip_address, timeout_seconds, fallback_privkey_path)
+        try:
+            async with conn:
+                result = await asyncio.wait_for(conn.run(cmd, encoding=None, check=False), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            raise IPCError(ERR_INTERNAL, f"pull timed out after {timeout_seconds}s")
+        except IPCError:
+            raise
+        except Exception as exc:
+            raise IPCError(ERR_INTERNAL, f"pull failed: {exc}") from exc
+        if result.exit_status:
+            err = (result.stderr or b"").decode(errors="replace").strip()
+            raise IPCError(ERR_INVALID_PARAMS, f"pull {path} failed: {err or result.exit_status}")
+        raw: bytes = result.stdout or b""
+        kind, _, data = raw.partition(b"\n")
+        if len(data) > max_bytes:
+            raise IPCError(ERR_INVALID_PARAMS, f"{path} exceeds the {max_bytes} byte pull limit")
+        return {"path": path, "is_archive": kind == b"D", "data": data}
 
     async def install_ssh_public_key(
         self,

@@ -64,6 +64,7 @@ def _domain_xml(
     ram_mb: int,
     disk_path: Path,
     cloud_init_iso: Optional[Path],
+    configdrive_iso: Optional[Path] = None,
     net_name: str,
     headless: bool,
     serial_log: Path,
@@ -82,18 +83,25 @@ def _domain_xml(
     <model type='qxl' ram='65536' vram='65536' vgamem='16384' heads='1'/>
   </video>"""
 
+    # Two seed disks on virtio bus so cloud-init-generator finds them before
+    # AHCI enumeration completes:
+    #   vdb: NoCloud (label "cidata")       — Ubuntu, Debian, Alpine
+    #   vdc: ConfigDrive (label "config-2") — RHEL, Rocky, AlmaLinux, CentOS
     cdrom_section = ""
     if cloud_init_iso:
-        # Use virtio instead of SATA CDROM.  The systemd cloud-init-generator
-        # runs early (before udev/SATA enumeration is complete) and calls blkid
-        # to scan for a 'cidata'-labelled disk.  Virtio block devices are
-        # enumerated by the virtio_blk driver before AHCI completes, so the
-        # cidata label is visible to the generator on all guest distributions.
-        cdrom_section = f"""
+        cdrom_section += f"""
     <disk type='file' device='disk'>
       <driver name='qemu' type='raw'/>
       <source file='{cloud_init_iso}'/>
       <target dev='vdb' bus='virtio'/>
+      <readonly/>
+    </disk>"""
+    if configdrive_iso:
+        cdrom_section += f"""
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='raw'/>
+      <source file='{configdrive_iso}'/>
+      <target dev='vdc' bus='virtio'/>
       <readonly/>
     </disk>"""
 
@@ -106,7 +114,13 @@ def _domain_xml(
   <os>
     <type arch='x86_64' machine='pc-q35-8.2'>hvm</type>
     <boot dev='hd'/>
+    <smbios mode='sysinfo'/>
   </os>
+  <sysinfo type='smbios'>
+    <system>
+      <entry name='serial'>ds=nocloud</entry>
+    </system>
+  </sysinfo>
   <features>
     <acpi/>
     <apic/>
@@ -459,6 +473,7 @@ class VMOperations:
         ram_mb: int,
         disk_path: Path,
         cloud_init_iso: Optional[Path],
+        configdrive_iso: Optional[Path] = None,
         net_name: str,
         headless: bool,
         serial_log: Path,
@@ -470,6 +485,7 @@ class VMOperations:
             ram_mb=ram_mb,
             disk_path=disk_path,
             cloud_init_iso=cloud_init_iso,
+            configdrive_iso=configdrive_iso,
             net_name=net_name,
             headless=headless,
             serial_log=serial_log,

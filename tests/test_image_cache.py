@@ -91,6 +91,85 @@ async def test_latest_policy_refreshes_on_manifest_change(tmp_path, monkeypatch)
     assert mgr._read_metadata("test")["current"]["digest"] == _sha(b"v2")
 
 
+def _latest_entry() -> dict:
+    return {
+        "type": "cloud-image",
+        "url": "https://x/base.qcow2",
+        "refresh_policy": "latest",
+        "verification": {"checksum_url": "https://x/SHA256SUMS", "checksum_filename": "base.qcow2"},
+    }
+
+
+async def test_latest_falls_back_to_cache_on_transient_manifest_error(tmp_path, monkeypatch) -> None:
+    import httpx
+
+    mgr = _manager(tmp_path, {"test": _latest_entry()})
+    state = {"content": b"v1"}
+    _stub_downloads(monkeypatch, mgr, state, manifest=True)
+
+    p1 = await mgr.ensure_image("test")
+
+    # Mirror goes unreachable: the manifest re-validation times out. A valid
+    # verified blob is already cached, so provisioning must keep working.
+    async def timeout_bytes(url: str) -> bytes:
+        raise httpx.ReadTimeout("mirror unreachable")
+
+    monkeypatch.setattr(mgr, "_download_bytes", timeout_bytes)
+
+    p2 = await mgr.ensure_image("test")
+    assert p2 == p1  # served from the previously verified cache
+    assert state["downloads"] == 1  # no image re-download
+
+
+async def test_latest_does_not_fall_back_on_verification_error(tmp_path, monkeypatch) -> None:
+    mgr = _manager(tmp_path, {"test": _latest_entry()})
+    state = {"content": b"v1"}
+    _stub_downloads(monkeypatch, mgr, state, manifest=True)
+    await mgr.ensure_image("test")
+
+    # Manifest is reachable but has no entry for our file — a real integrity
+    # failure that must fail closed, never silently serve stale bytes.
+    async def bad_manifest(url: str) -> bytes:
+        return b"deadbeef  someotherfile.qcow2\n"
+
+    monkeypatch.setattr(mgr, "_download_bytes", bad_manifest)
+    with pytest.raises(IPCError):
+        await mgr.ensure_image("test")
+
+
+async def test_forced_refresh_does_not_fall_back_on_transient_error(tmp_path, monkeypatch) -> None:
+    import httpx
+
+    mgr = _manager(tmp_path, {"test": _latest_entry()})
+    state = {"content": b"v1"}
+    _stub_downloads(monkeypatch, mgr, state, manifest=True)
+    await mgr.ensure_image("test")
+
+    async def timeout_bytes(url: str) -> bytes:
+        raise httpx.ReadTimeout("mirror unreachable")
+
+    monkeypatch.setattr(mgr, "_download_bytes", timeout_bytes)
+    # An explicit admin refresh wants the real upstream state, so it must surface
+    # the error rather than quietly returning the cached blob.
+    with pytest.raises(httpx.ReadTimeout):
+        await mgr.refresh_image("test")
+
+
+async def test_transient_error_with_no_cache_still_fails(tmp_path, monkeypatch) -> None:
+    import httpx
+
+    mgr = _manager(tmp_path, {"test": _latest_entry()})
+
+    async def timeout_bytes(url: str) -> bytes:
+        raise httpx.ReadTimeout("mirror unreachable")
+
+    monkeypatch.setattr(mgr, "_download_bytes", timeout_bytes)
+    # Nothing verified yet: there is no safe blob to serve, so this must fail.
+    with pytest.raises(httpx.ReadTimeout):
+        await mgr.ensure_image("test")
+    assert not mgr.is_cached("test")
+
+
 async def test_manual_policy_does_not_auto_refresh(tmp_path, monkeypatch) -> None:
     entry = {
         "type": "cloud-image",

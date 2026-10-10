@@ -86,6 +86,54 @@ async def test_box_list_images_unwraps_result() -> None:
 
 
 @pytest.mark.asyncio
+async def test_box_list_labs_calls_ipc() -> None:
+    with patch("boxer_mcp.tools.ipc", new_callable=AsyncMock) as mock_ipc:
+        mock_ipc.return_value = {"labs": [{"name": "linux-repro"}]}
+        from boxer_mcp.tools import box_list_labs
+        result = await box_list_labs()
+        mock_ipc.assert_called_once_with("lab.list", {})
+        assert result["labs"][0]["name"] == "linux-repro"
+
+
+@pytest.mark.asyncio
+async def test_box_request_lab_passes_params() -> None:
+    with patch("boxer_mcp.tools.ipc", new_callable=AsyncMock) as mock_ipc:
+        mock_ipc.return_value = {"vm_id": "vm_lab01", "lab": {"name": "docker-build"}}
+        from boxer_mcp.tools import box_request_lab
+        result = await box_request_lab(
+            lab="docker-build",
+            purpose="image-build",
+            template="ubuntu-24.04",
+            size="large",
+            ttl_minutes=180,
+            wait=False,
+            tags={"ticket": "ENG-42"},
+        )
+        assert mock_ipc.call_args[0] == (
+            "lab.request",
+            {
+                "lab": "docker-build",
+                "size": "large",
+                "wait": False,
+                "purpose": "image-build",
+                "template": "ubuntu-24.04",
+                "ttl_minutes": 180,
+                "tags": {"ticket": "ENG-42"},
+            },
+        )
+        assert result["lab"]["name"] == "docker-build"
+
+
+@pytest.mark.asyncio
+async def test_box_lab_status_passes_vm_id() -> None:
+    with patch("boxer_mcp.tools.ipc", new_callable=AsyncMock) as mock_ipc:
+        mock_ipc.return_value = {"lab": {"name": "linux-repro"}}
+        from boxer_mcp.tools import box_lab_status
+        await box_lab_status(vm_id="vm_lab01")
+        mock_ipc.assert_called_once_with("lab.status", {"vm_id": "vm_lab01"})
+
+
+@pytest.mark.asyncio
 async def test_box_prewarm_image_passes_template() -> None:
     with patch("boxer_mcp.tools.ipc", new_callable=AsyncMock) as mock_ipc:
         mock_ipc.return_value = {"template": "fedora-44", "cached": True}

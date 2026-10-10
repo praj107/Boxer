@@ -186,3 +186,176 @@ Notes:
   families; on other families the package step is best-effort.
 - The seed-wipe is best-effort defence-in-depth; the cloud-init NoCloud ISO is
   still the delivery vector, so treat `secret_files` as one-time material.
+
+## Milestone 6: Agent-Tuned MCP Profiles
+
+Status: implemented in this branch.
+
+Make the MCP surface adapt to the host/model harness without changing the daemon
+security boundary.
+
+Scope:
+
+- Profile-aware MCP server construction (`boxer-mcp --profile NAME` or
+  `BOXER_MCP_PROFILE`) with:
+  - `codex` (default): full rich surface with Codex-front-loaded server
+    instructions;
+  - `claude`: full rich surface with Claude Code Tool Search-friendly
+    instructions;
+  - `qwen`, `deepseek`, `kimi`, and `oss`: compact low-context surfaces for
+    stricter or low-context tool callers;
+  - `readonly`: inspection tools and no create/execute/mutate/delete tools.
+- Compact profiles keep the public `box_request_vm` tool name but expose a
+  smaller schema: template, purpose, profiles, headless, TTL, readiness waits,
+  and wait timeout.
+- MCP `ToolAnnotations` added for read-only, destructive, idempotent, and
+  open-world hints where the Python MCP SDK supports them.
+- Client-neutral `BOXER_PROJECT_DIR` added ahead of `CLAUDE_PROJECT_DIR` for
+  project identity, so non-Claude MCP hosts can preserve Boxer isolation even
+  when stdio starts outside the repository root.
+- README client snippets updated for Claude Code, Codex, Qwen Code,
+  DeepSeek-backed agents, Kimi-backed agents, and generic local harnesses.
+- Detailed profile design note added at `docs/MCP-Agent-Profiles.md`.
+
+Reference sources used for this profile direction:
+
+- Claude Code MCP and Tool Search: https://code.claude.com/docs/en/mcp
+- Codex MCP server instructions: https://developers.openai.com/codex/codex-manual.md
+- Qwen Code MCP configuration: https://qwenlm.github.io/qwen-code-docs/en/users/features/mcp/
+- DeepSeek tool calls and strict mode: https://api-docs.deepseek.com/guides/tool_calls
+- DeepSeek chat-completion tool schema: https://api-docs.deepseek.com/api/create-chat-completion
+- Kimi K2 tool calling: https://github.com/MoonshotAI/Kimi-K2
+
+## Milestone 7: Agent Lab Recipes
+
+Status: implemented in this branch.
+
+Reposition Boxer from generic VM operations toward a practical agent niche:
+local, policy-enforced KVM labs for real Linux validation work.
+
+Scope:
+
+- New daemon lab recipe catalog (`boxerd/labs.py`) with five single-VM recipes:
+  `linux-repro`, `distro-smoke`, `docker-build`, `web-ui`, and
+  `headed-desktop`.
+- New IPC methods:
+  - `lab.list`: returns recipes and stack constraints;
+  - `lab.request`: compiles a recipe into the existing audited `vm.request`
+    path, preserving image catalog verification, scheduling, leases, queueing,
+    per-project networks, and policy;
+  - `lab.status`: returns lab-oriented VM status and next steps.
+- New MCP tools:
+  `box_list_labs`, `box_request_lab`, and `box_lab_status`.
+  Rich profiles now expose 28 tools; compact profiles expose 16 tools with
+  lab-first instructions; readonly exposes 11 inspection tools.
+- New CLI commands:
+  `boxer labs`, `boxer lab list`, `boxer lab request`, and
+  `boxer lab status`.
+- Documentation added at `docs/Agent-Labs.md` explaining the product niche,
+  research consolidation, recipes, MCP flow, CLI flow, and explicit bounds.
+
+Reference sources used for this direction:
+
+- Claude Code dev containers: https://code.claude.com/docs/en/devcontainer
+- Claude Code MCP workflows: https://code.claude.com/docs/en/mcp
+- OpenAI local shell sandbox guidance: https://developers.openai.com/api/docs/guides/tools-local-shell
+- VM-backed sandbox MCP example: https://github.com/bird/sandbox-mcp
+- Container sandbox MCP example: https://protodex.io/servers/automata-labs-team-code-sandbox-mcp.html
+
+## Milestone 8: Android End-to-End App Testing
+
+Status: implemented in this branch (live emulator pass pending host SDK — see note).
+
+Bring Android app testing into Boxer's lab model using the official SDK Android
+Emulator, controlled agentically over ADB.
+
+Decisions (consultation 2026-06-20):
+
+- Backend: the **SDK Android Emulator** (`emulator` + `sdkmanager` system images),
+  not android-x86, Cuttlefish, or Waydroid. Best app-test fidelity, official
+  variants, ADB, headless ATD images.
+- Execution: **host-direct managed process** supervised by boxerd (needs Android
+  SDK + `/dev/kvm` on the host), not nested-in-libvirt-VM.
+- Images: drive `sdkmanager` against an **allowlist of system-image package
+  specs** (`config/android.yaml`); sdkmanager performs its own download +
+  checksum verification + license acceptance. Android blobs are not added to the
+  `images.yaml` URL allowlist.
+- Control: **ad-hoc UIAutomator + structured logcat first** (dump the UI tree as
+  compact JSON, tap/swipe/type by selector, screenshots), with an instrumentation
+  runner (`am instrument`) as a secondary path. No in-app SDK.
+- Data model: **unified with VMs** — Android devices reuse the `vms` record,
+  leases, policy, per-project caps, and queue via a `kind` discriminator and a
+  backend dispatch (`libvirt` vs `emulator`); they appear in `box_list_vms`,
+  `box_get_vm`, `box_delete_vm`, `box_extend_lease`.
+
+Catalog seed: API 28-30, 33/34, 35/36, `google_apis` + `aosp_atd`, x86_64 +
+arm64-v8a. Automation defaults to `google_apis`/`aosp_atd` (never
+`google_apis_playstore`, which blocks `adb root`).
+
+Progress journal:
+
+- [x] DB `kind` column + `VMRecord.kind` (backend dispatch wired in daemon/lease below).
+- [x] `android_sdk.py` (SDK discovery + KVM/license preflight).
+- [x] `emulator_ops.py` (AVD create/launch/boot-wait/state/stop/delete, port alloc).
+- [x] `adb_ops.py` (UIAutomator dump→JSON, input, app control, logcat, instrument).
+- [x] `config/android.yaml` catalog + loader + config keys.
+- [x] Backend dispatch (`_ops_for`) wired in daemon + lease manager.
+- [x] IPC handlers (`android.list_images`, `android.request`, `android.adb`) + queue job type.
+- [x] MCP tools (`box_request_android`, `box_android_ui/app/screenshot/logcat`, `box_run_instrumentation`) + opt-in `android` profile.
+- [x] CLI (`boxer android images|request|ui|app|logcat`).
+- [x] Docs (`docs/Android-Testing.md`) + tests (catalog, kind roundtrip, ADB/emulator parsers).
+
+Note: emulator/ADB code is unit-tested via pure parsers and dry-run import; a live
+end-to-end pass needs the Android SDK + system images + `/dev/kvm` on the host
+(multi-GB, one-time `sdkmanager --licenses`). `box_list_android_images` reports
+SDK/KVM availability for that check.
+
+Reference sources used for this direction:
+
+- Android emulator command-line / headless: https://developer.android.com/studio/run/emulator-commandline
+- AVD system images & ATD: https://developer.android.com/studio/run/managing-avds
+- sdkmanager: https://developer.android.com/tools/sdkmanager
+- adb (logcat, am instrument, uiautomator): https://developer.android.com/tools/adb
+- UI Automator: https://developer.android.com/training/testing/other-components/ui-automator
+
+## Milestone 9: Linux Guest Utils
+
+Status: implemented in this branch.
+
+Give agents structured, token-efficient system info and control inside Linux
+guests instead of guessing shell commands over an SSH terminal.
+
+Decisions (consultation 2026-06-20):
+
+- Architecture: **hybrid**. Daemon-side curated JSON tools are the zero-install
+  baseline (work on every distro, BYOISO, over the existing SSH channel); an
+  optional **static Go binary** in-guest agent (`boxerctl`, installed via a
+  cloud-init profile) provides richer single-round-trip telemetry. The MCP
+  surface is identical either way; the daemon prefers `boxerctl` when present.
+- Capabilities (all four): system snapshot, services & processes, packages
+  (query/search/install — install is policy-gated and mutating), logs & health.
+
+Progress journal:
+
+- [x] `guest_utils.py` (daemon-side, family-aware parsers, boxerctl preferred).
+- [x] `agent/boxerctl` Go source + build script + injection wiring + `boxerctl` profile.
+- [x] IPC handlers (`guest.sysinfo`, `guest.services`, `guest.packages`, `guest.logs`) + ownership policy.
+- [x] MCP tools (`box_sysinfo`, `box_services`, `box_packages`, `box_logs`) + rich/compact/readonly exposure.
+- [x] CLI (`boxer guest info|services|packages|logs`).
+- [x] Docs (`docs/Guest-Utils.md`) + tests (sysinfo/services/logs parsers, boxerctl-preferred dispatch).
+
+## Milestone 10: Guest File Transfer & Robust Exec
+
+Status: implemented (2026-10-10).
+
+- `vm.push_files` / `vm.pull` IPC methods (ownership-checked, absolute guest paths, 32 MiB cap,
+  64 files per push, base64 payloads), carried over the existing asyncssh channel: no scp/sftp.
+- MCP `box_push` / `box_pull` (rich and compact profiles); packing and unpacking happen in the
+  caller's process, so host paths use the user's own permissions. Directory pulls unpack with
+  `tarfile` `filter="data"` (no path traversal).
+- `vm.exec`: `detach` (setsid/nohup, pid + log path) and `wait_ssh_seconds` (connect retry).
+- `box_screenshot(save_path=...)`; CLI `boxer exec | push | pull | screenshot`.
+- IPC line limit raised from asyncio's 64 KiB default to 64 MiB on both ends.
+- SSH key falls back to `/etc/boxer/boxer_id_ed25519` when `boxer.yaml` leaves it unset, so
+  `scripts/reload.sh` re-syncing `boxer.yaml` no longer disables exec.
+

@@ -425,41 +425,46 @@ if [[ ! -f "${SSH_KEY_PATH}" ]]; then
         echo "[DRY-RUN] ssh-keygen -t ed25519 -N '' -C boxer-vm-access -f ${SSH_KEY_PATH} -q"
         echo "[DRY-RUN] chmod 0600 ${SSH_KEY_PATH}"
         echo "[DRY-RUN] chmod 0644 ${SSH_KEY_PATH}.pub"
-        echo "[DRY-RUN] inject boxer_ssh_pubkey into ${CONFIG_DIR}/boxer.yaml"
     else
         run_cmd ssh-keygen -t ed25519 -N "" -C "boxer-vm-access" -f "${SSH_KEY_PATH}" -q
         run_cmd chmod 0600 "${SSH_KEY_PATH}"
         run_cmd chmod 0644 "${SSH_KEY_PATH}.pub"
-        _PUBKEY=$(cat "${SSH_KEY_PATH}.pub")
-
-        # Inject public key into boxer.yaml — use _sed_inplace for atomicity
-        if grep -q '^# boxer_ssh_pubkey' "${CONFIG_DIR}/boxer.yaml"; then
-            _sed_inplace "${CONFIG_DIR}/boxer.yaml" \
-                "s|^# boxer_ssh_pubkey:.*|boxer_ssh_pubkey: \"${_PUBKEY}\"|"
-        elif ! grep -q '^boxer_ssh_pubkey' "${CONFIG_DIR}/boxer.yaml"; then
-            _tmp_yaml=$(_mktmp -- "${CONFIG_DIR}/boxer.yaml.XXXXXX")
-            { cat "${CONFIG_DIR}/boxer.yaml"; printf 'boxer_ssh_pubkey: "%s"\n' "${_PUBKEY}"; } \
-                > "${_tmp_yaml}"
-            chmod 0640 "${_tmp_yaml}"
-            chown "root:${CONFIG_GROUP}" "${_tmp_yaml}"
-            mv -f "${_tmp_yaml}" "${CONFIG_DIR}/boxer.yaml"
-        fi
-
-        if grep -q '^# boxer_ssh_privkey_path' "${CONFIG_DIR}/boxer.yaml"; then
-            _sed_inplace "${CONFIG_DIR}/boxer.yaml" \
-                "s|^# boxer_ssh_privkey_path:.*|boxer_ssh_privkey_path: ${SSH_KEY_PATH}|"
-        elif ! grep -q '^boxer_ssh_privkey_path' "${CONFIG_DIR}/boxer.yaml"; then
-            _tmp_yaml2=$(_mktmp -- "${CONFIG_DIR}/boxer.yaml.XXXXXX")
-            { cat "${CONFIG_DIR}/boxer.yaml"; printf 'boxer_ssh_privkey_path: %s\n' "${SSH_KEY_PATH}"; } \
-                > "${_tmp_yaml2}"
-            chmod 0640 "${_tmp_yaml2}"
-            chown "root:${CONFIG_GROUP}" "${_tmp_yaml2}"
-            mv -f "${_tmp_yaml2}" "${CONFIG_DIR}/boxer.yaml"
-        fi
         ok "SSH keypair generated at ${SSH_KEY_PATH}"
     fi
 else
     ok "SSH keypair already exists at ${SSH_KEY_PATH} — skipped."
+fi
+
+# Inject key paths into boxer.yaml — runs whether the key was just generated or
+# pre-existed. Previously this block was inside the "new key" branch only, so any
+# re-run where the key already existed (e.g. config wiped and setup re-run) would
+# leave boxer.yaml with the commented-out placeholders and the daemon unable to SSH.
+if [[ "${DRY_RUN}" -eq 1 ]]; then
+    echo "[DRY-RUN] inject boxer_ssh_pubkey and boxer_ssh_privkey_path into ${CONFIG_DIR}/boxer.yaml"
+elif [[ -f "${SSH_KEY_PATH}" ]]; then
+    _PUBKEY=$(cat "${SSH_KEY_PATH}.pub")
+    if grep -q '^# boxer_ssh_pubkey' "${CONFIG_DIR}/boxer.yaml"; then
+        _sed_inplace "${CONFIG_DIR}/boxer.yaml" \
+            "s|^# boxer_ssh_pubkey:.*|boxer_ssh_pubkey: \"${_PUBKEY}\"|"
+    elif ! grep -q '^boxer_ssh_pubkey' "${CONFIG_DIR}/boxer.yaml"; then
+        _tmp_yaml=$(_mktmp -- "${CONFIG_DIR}/boxer.yaml.XXXXXX")
+        { cat "${CONFIG_DIR}/boxer.yaml"; printf 'boxer_ssh_pubkey: "%s"\n' "${_PUBKEY}"; } \
+            > "${_tmp_yaml}"
+        chmod 0640 "${_tmp_yaml}"
+        chown "root:${CONFIG_GROUP}" "${_tmp_yaml}"
+        mv -f "${_tmp_yaml}" "${CONFIG_DIR}/boxer.yaml"
+    fi
+    if grep -q '^# boxer_ssh_privkey_path' "${CONFIG_DIR}/boxer.yaml"; then
+        _sed_inplace "${CONFIG_DIR}/boxer.yaml" \
+            "s|^# boxer_ssh_privkey_path:.*|boxer_ssh_privkey_path: ${SSH_KEY_PATH}|"
+    elif ! grep -q '^boxer_ssh_privkey_path' "${CONFIG_DIR}/boxer.yaml"; then
+        _tmp_yaml2=$(_mktmp -- "${CONFIG_DIR}/boxer.yaml.XXXXXX")
+        { cat "${CONFIG_DIR}/boxer.yaml"; printf 'boxer_ssh_privkey_path: %s\n' "${SSH_KEY_PATH}"; } \
+            > "${_tmp_yaml2}"
+        chmod 0640 "${_tmp_yaml2}"
+        chown "root:${CONFIG_GROUP}" "${_tmp_yaml2}"
+        mv -f "${_tmp_yaml2}" "${CONFIG_DIR}/boxer.yaml"
+    fi
 fi
 if [[ "${DRY_RUN}" -eq 0 ]]; then
     chown root:root "${SSH_KEY_PATH}" 2>/dev/null || true

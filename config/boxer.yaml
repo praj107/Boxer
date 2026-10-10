@@ -23,6 +23,17 @@ default_ttl_minutes: 60
 stale_warn_grace_minutes: 15
 stale_delete_grace_hours: 24
 
+# Automatic cleanup of expired VMs that still run after their lease.
+# Repos with fewer than inactive_call_threshold MCP calls during the call window
+# are treated as inactive: Boxer asks the guest to shut down gracefully first,
+# then forces power off after the force grace if it is still running.
+stale_cleanup_interval_minutes: 10
+inactive_call_window_minutes: 10
+inactive_call_threshold: 3
+stale_force_shutdown_after_minutes: 10
+cleanup_process_snapshot_lines: 16
+project_call_log_retention_hours: 24
+
 # SSH access into VMs
 # boxer_ssh_pubkey: "ssh-ed25519 AAAA..."
 # boxer_ssh_privkey_path: /etc/boxer/boxer_id_ed25519
@@ -43,3 +54,13 @@ qemu_group: kvm
 # When unset (default), any accessible ISO path is accepted — suitable for a
 # single-developer workstation where all IPC callers are trusted.
 # local_iso_dir: /var/lib/boxer/local-isos
+
+# Android emulator subsystem (Milestone 8)
+# Off by default. Enable after installing the Android command-line SDK
+# (cmdline-tools, platform-tools, emulator) and ensuring /dev/kvm is accessible
+# to the boxerd user. Allowed system images are listed in android.yaml.
+android_enabled: false
+# android_sdk_root: /opt/android-sdk   # else ANDROID_SDK_ROOT / ANDROID_HOME
+max_concurrent_emulators: 1
+emulator_console_port_min: 5554
+emulator_console_port_max: 5680

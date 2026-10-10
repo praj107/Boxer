@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Coroutine, Optional
 
 from boxer.ipc import (
+    MAX_MESSAGE_BYTES,
     ERR_INTERNAL,
     ERR_METHOD_NOT_FOUND,
     ERR_PARSE,
@@ -45,7 +46,7 @@ class IPCServer:
         if self._socket_path.exists():
             self._socket_path.unlink()
         self._server = await asyncio.start_unix_server(
-            self._handle_connection, str(self._socket_path)
+            self._handle_connection, str(self._socket_path), limit=MAX_MESSAGE_BYTES
         )
         os.chmod(str(self._socket_path), 0o660)
         logger.info("IPC server listening on %s", self._socket_path)

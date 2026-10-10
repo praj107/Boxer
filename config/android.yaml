@@ -1,0 +1,130 @@
+# Boxer Android system-image catalog (Milestone 8)
+#
+# This is an ALLOWLIST of sdkmanager system-image package specs Boxer may
+# install and boot. Boxer drives `sdkmanager <package>` (which performs its own
+# download, checksum verification, and license acceptance) — Android blobs are
+# deliberately NOT fetched through the images.yaml URL allowlist.
+#
+# Each entry:
+#   api            Android API level
+#   variant        google_apis | aosp_atd  (never google_apis_playstore for
+#                  automation: it blocks `adb root` and needs a signed-in account)
+#   abi            x86_64 (KVM-accelerated on x86 hosts) | arm64-v8a (slower)
+#   package        the exact sdkmanager system-image package spec
+#   device         avdmanager device profile (-d)
+#   default_ram_mb / default_cores / default_data_gb  AVD sizing defaults
+
+images:
+  # ---- Latest stable -------------------------------------------------------
+  android-36-google_apis-x86_64:
+    api: 36
+    variant: google_apis
+    abi: x86_64
+    package: "system-images;android-36;google_apis;x86_64"
+    device: pixel_6
+    default_ram_mb: 3072
+    default_cores: 4
+    default_data_gb: 6
+  android-36-aosp_atd-x86_64:
+    api: 36
+    variant: aosp_atd
+    abi: x86_64
+    package: "system-images;android-36;aosp_atd;x86_64"
+    device: pixel_6
+    default_ram_mb: 2560
+    default_cores: 4
+    default_data_gb: 6
+  android-35-google_apis-x86_64:
+    api: 35
+    variant: google_apis
+    abi: x86_64
+    package: "system-images;android-35;google_apis;x86_64"
+    device: pixel_6
+    default_ram_mb: 3072
+    default_cores: 4
+    default_data_gb: 6
+  android-35-aosp_atd-x86_64:
+    api: 35
+    variant: aosp_atd
+    abi: x86_64
+    package: "system-images;android-35;aosp_atd;x86_64"
+    device: pixel_6
+    default_ram_mb: 2560
+    default_cores: 4
+    default_data_gb: 6
+  android-35-google_apis-arm64-v8a:
+    api: 35
+    variant: google_apis
+    abi: arm64-v8a
+    package: "system-images;android-35;google_apis;arm64-v8a"
+    device: pixel_6
+    default_ram_mb: 3072
+    default_cores: 4
+    default_data_gb: 6
+
+  # ---- One LTS-ish older ---------------------------------------------------
+  android-34-google_apis-x86_64:
+    api: 34
+    variant: google_apis
+    abi: x86_64
+    package: "system-images;android-34;google_apis;x86_64"
+    device: pixel_5
+    default_ram_mb: 3072
+    default_cores: 4
+    default_data_gb: 6
+  android-34-aosp_atd-x86_64:
+    api: 34
+    variant: aosp_atd
+    abi: x86_64
+    package: "system-images;android-34;aosp_atd;x86_64"
+    device: pixel_5
+    default_ram_mb: 2560
+    default_cores: 4
+    default_data_gb: 6
+  android-33-google_apis-x86_64:
+    api: 33
+    variant: google_apis
+    abi: x86_64
+    package: "system-images;android-33;google_apis;x86_64"
+    device: pixel_5
+    default_ram_mb: 3072
+    default_cores: 4
+    default_data_gb: 6
+  android-33-google_apis-arm64-v8a:
+    api: 33
+    variant: google_apis
+    abi: arm64-v8a
+    package: "system-images;android-33;google_apis;arm64-v8a"
+    device: pixel_5
+    default_ram_mb: 3072
+    default_cores: 4
+    default_data_gb: 6
+
+  # ---- Older baseline (min-SDK / legacy behavior) --------------------------
+  android-30-google_apis-x86_64:
+    api: 30
+    variant: google_apis
+    abi: x86_64
+    package: "system-images;android-30;google_apis;x86_64"
+    device: pixel_3a
+    default_ram_mb: 2560
+    default_cores: 2
+    default_data_gb: 5
+  android-29-google_apis-x86_64:
+    api: 29
+    variant: google_apis
+    abi: x86_64
+    package: "system-images;android-29;google_apis;x86_64"
+    device: pixel_3a
+    default_ram_mb: 2560
+    default_cores: 2
+    default_data_gb: 5
+  android-28-google_apis-x86_64:
+    api: 28
+    variant: google_apis
+    abi: x86_64
+    package: "system-images;android-28;google_apis;x86_64"
+    device: pixel_2
+    default_ram_mb: 2048
+    default_cores: 2
+    default_data_gb: 5

@@ -7,10 +7,14 @@ import yaml
 
 _CONFIG_ENV = "BOXER_CONFIG_PATH"
 _IMAGES_ENV = "BOXER_IMAGES_PATH"
+_ANDROID_ENV = "BOXER_ANDROID_PATH"
 _DEFAULT_CONFIG_PATH = Path("/etc/boxer/boxer.yaml")
 _DEFAULT_IMAGES_PATH = Path("/etc/boxer/images.yaml")
+_DEFAULT_ANDROID_PATH = Path("/etc/boxer/android.yaml")
+DEFAULT_SSH_KEY_PATH = Path("/etc/boxer/boxer_id_ed25519")
 _FALLBACK_CONFIG_PATH = Path(__file__).parent.parent / "config" / "boxer.yaml"
 _FALLBACK_IMAGES_PATH = Path(__file__).parent.parent / "config" / "images.yaml"
+_FALLBACK_ANDROID_PATH = Path(__file__).parent.parent / "config" / "android.yaml"
 
 
 class ConfigLoadError(RuntimeError):
@@ -118,15 +122,52 @@ class BoxerConfig:
     def stale_delete_grace_hours(self) -> int:
         return int(self._d.get("stale_delete_grace_hours", 24))
 
+    @property
+    def stale_cleanup_interval_minutes(self) -> int:
+        return int(self._d.get("stale_cleanup_interval_minutes", 10))
+
+    @property
+    def inactive_call_window_minutes(self) -> int:
+        return int(self._d.get("inactive_call_window_minutes", self.stale_cleanup_interval_minutes))
+
+    @property
+    def inactive_call_threshold(self) -> int:
+        return int(self._d.get("inactive_call_threshold", 3))
+
+    @property
+    def stale_force_shutdown_after_minutes(self) -> int:
+        return int(self._d.get("stale_force_shutdown_after_minutes", self.stale_cleanup_interval_minutes))
+
+    @property
+    def cleanup_process_snapshot_lines(self) -> int:
+        return int(self._d.get("cleanup_process_snapshot_lines", 16))
+
+    @property
+    def project_call_log_retention_hours(self) -> int:
+        return int(self._d.get("project_call_log_retention_hours", 24))
+
     # SSH
+    # When boxer.yaml leaves these unset (scripts/reload.sh re-syncs boxer.yaml from the repo,
+    # where they are commented out), fall back to the key pair scripts/setup.sh generates, so
+    # exec/push/pull keep working after a reload.
     @property
     def boxer_ssh_pubkey(self) -> Optional[str]:
-        return self._d.get("boxer_ssh_pubkey")
+        configured = self._d.get("boxer_ssh_pubkey")
+        if configured:
+            return configured
+        priv = self.boxer_ssh_privkey_path
+        pub = Path(str(priv) + ".pub") if priv else None
+        try:
+            return pub.read_text().strip() if pub and pub.is_file() else None
+        except OSError:
+            return None
 
     @property
     def boxer_ssh_privkey_path(self) -> Optional[Path]:
         p = self._d.get("boxer_ssh_privkey_path")
-        return Path(p) if p else None
+        if p:
+            return Path(p)
+        return DEFAULT_SSH_KEY_PATH if DEFAULT_SSH_KEY_PATH.exists() else None
 
     # Libvirt
     @property
@@ -164,6 +205,29 @@ class BoxerConfig:
         """Host group used by QEMU processes for VM disk/ISO access."""
         return self._d.get("qemu_group", "kvm")
 
+    # Android emulator subsystem (Milestone 8)
+    @property
+    def android_enabled(self) -> bool:
+        """Master switch for the Android emulator device backend."""
+        return bool(self._d.get("android_enabled", False))
+
+    @property
+    def android_sdk_root(self) -> Optional[str]:
+        """Android command-line SDK root; falls back to ANDROID_SDK_ROOT/ANDROID_HOME."""
+        return self._d.get("android_sdk_root")
+
+    @property
+    def max_concurrent_emulators(self) -> int:
+        return int(self._d.get("max_concurrent_emulators", 1))
+
+    @property
+    def emulator_console_port_min(self) -> int:
+        return int(self._d.get("emulator_console_port_min", 5554))
+
+    @property
+    def emulator_console_port_max(self) -> int:
+        return int(self._d.get("emulator_console_port_max", 5680))
+
 
 class ImageCatalog:
     def __init__(self, data: dict[str, Any]):
@@ -176,8 +240,25 @@ class ImageCatalog:
         return list(self._images.keys())
 
 
+class AndroidCatalog:
+    """Allowlist of sdkmanager system-image package specs Boxer may install/boot."""
+
+    def __init__(self, data: dict[str, Any]):
+        self._images: dict[str, dict[str, Any]] = (data or {}).get("images", {})
+
+    def get(self, name: str) -> Optional[dict[str, Any]]:
+        return self._images.get(name)
+
+    def list_names(self) -> list[str]:
+        return list(self._images.keys())
+
+    def list_entries(self) -> list[dict[str, Any]]:
+        return [{"name": name, **entry} for name, entry in self._images.items()]
+
+
 _config: Optional[BoxerConfig] = None
 _catalog: Optional[ImageCatalog] = None
+_android_catalog: Optional[AndroidCatalog] = None
 
 
 def get_config() -> BoxerConfig:
@@ -198,7 +279,22 @@ def get_catalog() -> ImageCatalog:
     return _catalog
 
 
+def get_android_catalog() -> AndroidCatalog:
+    global _android_catalog
+    if _android_catalog is None:
+        _android_catalog = AndroidCatalog(
+            _load_yaml(
+                _DEFAULT_ANDROID_PATH,
+                _FALLBACK_ANDROID_PATH,
+                env_var=_ANDROID_ENV,
+                label="android catalog",
+            )
+        )
+    return _android_catalog
+
+
 def reload():
-    global _config, _catalog
+    global _config, _catalog, _android_catalog
     _config = None
     _catalog = None
+    _android_catalog = None

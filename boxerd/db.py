@@ -10,7 +10,7 @@ from typing import Any, AsyncIterator, Optional
 
 import aiosqlite
 
-from boxer.types import Event, QueueEntry, VMRecord
+from boxer.types import CleanupAction, Event, ProjectNotification, QueueEntry, VMRecord
 
 _SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS vms (
     lease_until  TEXT NOT NULL,
     artifact_type TEXT NOT NULL DEFAULT 'cloud-image',
     install_state TEXT,
+    kind         TEXT NOT NULL DEFAULT 'vm',
     FOREIGN KEY (project_id) REFERENCES projects(id)
 );
 
@@ -71,9 +72,41 @@ CREATE TABLE IF NOT EXISTS events (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS project_call_log (
+    id          TEXT PRIMARY KEY,
+    project_id  TEXT NOT NULL,
+    method      TEXT NOT NULL,
+    caller_user TEXT NOT NULL DEFAULT '',
+    called_at   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vm_cleanup_actions (
+    vm_id                  TEXT PRIMARY KEY,
+    project_id             TEXT NOT NULL,
+    stage                  TEXT NOT NULL,
+    graceful_requested_at  TEXT NOT NULL,
+    force_after            TEXT NOT NULL,
+    last_error             TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (vm_id) REFERENCES vms(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS project_notifications (
+    id           TEXT PRIMARY KEY,
+    project_id   TEXT NOT NULL,
+    vm_id        TEXT,
+    level        TEXT NOT NULL,
+    message      TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    status       TEXT NOT NULL DEFAULT 'pending',
+    created_at   TEXT NOT NULL,
+    delivered_at TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_vms_project ON vms(project_id);
 CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);
 CREATE INDEX IF NOT EXISTS idx_queue_status ON queue(status, priority);
+CREATE INDEX IF NOT EXISTS idx_project_call_log_project_time ON project_call_log(project_id, called_at);
+CREATE INDEX IF NOT EXISTS idx_project_notifications_pending ON project_notifications(project_id, status, created_at);
 """
 
 
@@ -106,6 +139,40 @@ def _vm_from_row(row: aiosqlite.Row, tags: dict[str, str]) -> VMRecord:
         origin=row["origin"] if "origin" in row.keys() else "boxer",
         artifact_type=row["artifact_type"] if "artifact_type" in row.keys() else "cloud-image",
         install_state=row["install_state"] if "install_state" in row.keys() else None,
+        kind=row["kind"] if "kind" in row.keys() else "vm",
+    )
+
+
+def _cleanup_action_from_row(row: aiosqlite.Row) -> CleanupAction:
+    return CleanupAction(
+        vm_id=row["vm_id"],
+        project_id=row["project_id"],
+        stage=row["stage"],
+        graceful_requested_at=_parse_dt(row["graceful_requested_at"]),
+        force_after=_parse_dt(row["force_after"]),
+        last_error=row["last_error"] or "",
+    )
+
+
+def _notification_from_row(row: aiosqlite.Row) -> ProjectNotification:
+    details_raw = row["details_json"] or "{}"
+    try:
+        details = json.loads(details_raw)
+    except Exception:
+        details = {"raw": details_raw}
+    if not isinstance(details, dict):
+        details = {"value": details}
+    delivered_at = row["delivered_at"]
+    return ProjectNotification(
+        id=row["id"],
+        project_id=row["project_id"],
+        vm_id=row["vm_id"],
+        level=row["level"],
+        message=row["message"],
+        details=details,
+        status=row["status"],
+        created_at=_parse_dt(row["created_at"]),
+        delivered_at=_parse_dt(delivered_at) if delivered_at else None,
     )
 
 
@@ -125,6 +192,7 @@ class Database:
             "ALTER TABLE vms ADD COLUMN origin TEXT NOT NULL DEFAULT 'boxer'",
             "ALTER TABLE vms ADD COLUMN artifact_type TEXT NOT NULL DEFAULT 'cloud-image'",
             "ALTER TABLE vms ADD COLUMN install_state TEXT",
+            "ALTER TABLE vms ADD COLUMN kind TEXT NOT NULL DEFAULT 'vm'",
         ):
             try:
                 await self._db.execute(ddl)
@@ -163,15 +231,15 @@ class Database:
             await db.execute(
                 """INSERT INTO vms(id,libvirt_name,project_id,display_name,state,owner_user,
                    template,cpu,ram_mb,disk_gb,headless,ip_address,created_at,last_touched,
-                   lease_until,origin,artifact_type,install_state)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   lease_until,origin,artifact_type,install_state,kind)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     vm.id, vm.libvirt_name, vm.project_id, vm.display_name, vm.state,
                     vm.owner_user, vm.template, vm.cpu, vm.ram_mb, vm.disk_gb,
                     int(vm.headless), vm.ip_address,
                     vm.created_at.isoformat(), vm.last_touched.isoformat(),
                     vm.lease_until.isoformat(), vm.origin,
-                    vm.artifact_type, vm.install_state,
+                    vm.artifact_type, vm.install_state, vm.kind,
                 ),
             )
             for k, v in vm.tags.items():
@@ -335,6 +403,150 @@ class Database:
             )
             await db.commit()
             return cur.rowcount
+
+    # --- Project activity / cleanup state ---
+
+    async def record_project_call(
+        self,
+        project_id: str,
+        method: str,
+        caller_user: str = "",
+    ) -> str:
+        call_id = "call_" + uuid.uuid4().hex[:12]
+        async with self._conn() as db:
+            await db.execute(
+                """INSERT INTO project_call_log(id,project_id,method,caller_user,called_at)
+                   VALUES(?,?,?,?,?)""",
+                (call_id, project_id, method, caller_user or "", _now()),
+            )
+            await db.commit()
+        return call_id
+
+    async def count_project_calls_since(self, project_id: str, since: datetime) -> int:
+        async with self._conn() as db:
+            async with db.execute(
+                """SELECT COUNT(*) AS n FROM project_call_log
+                   WHERE project_id=? AND called_at>=?""",
+                (project_id, since.isoformat()),
+            ) as cur:
+                row = await cur.fetchone()
+        return int(row["n"]) if row else 0
+
+    async def prune_project_call_log(self, older_than: datetime) -> int:
+        async with self._conn() as db:
+            cur = await db.execute(
+                "DELETE FROM project_call_log WHERE called_at<?",
+                (older_than.isoformat(),),
+            )
+            await db.commit()
+            return cur.rowcount
+
+    async def get_cleanup_action(self, vm_id: str) -> Optional[CleanupAction]:
+        async with self._conn() as db:
+            async with db.execute(
+                "SELECT * FROM vm_cleanup_actions WHERE vm_id=?",
+                (vm_id,),
+            ) as cur:
+                row = await cur.fetchone()
+        return _cleanup_action_from_row(row) if row else None
+
+    async def upsert_cleanup_action(
+        self,
+        vm_id: str,
+        project_id: str,
+        stage: str,
+        graceful_requested_at: datetime,
+        force_after: datetime,
+        last_error: str = "",
+    ) -> None:
+        async with self._conn() as db:
+            await db.execute(
+                """INSERT INTO vm_cleanup_actions(
+                       vm_id,project_id,stage,graceful_requested_at,force_after,last_error
+                   ) VALUES(?,?,?,?,?,?)
+                   ON CONFLICT(vm_id) DO UPDATE SET
+                       project_id=excluded.project_id,
+                       stage=excluded.stage,
+                       graceful_requested_at=excluded.graceful_requested_at,
+                       force_after=excluded.force_after,
+                       last_error=excluded.last_error""",
+                (
+                    vm_id,
+                    project_id,
+                    stage,
+                    graceful_requested_at.isoformat(),
+                    force_after.isoformat(),
+                    last_error,
+                ),
+            )
+            await db.commit()
+
+    async def delete_cleanup_action(self, vm_id: str) -> None:
+        async with self._conn() as db:
+            await db.execute("DELETE FROM vm_cleanup_actions WHERE vm_id=?", (vm_id,))
+            await db.commit()
+
+    # --- Project notifications ---
+
+    async def add_project_notification(
+        self,
+        project_id: str,
+        level: str,
+        message: str,
+        *,
+        vm_id: Optional[str] = None,
+        details: Optional[dict[str, Any]] = None,
+    ) -> ProjectNotification:
+        notification_id = "note_" + uuid.uuid4().hex[:12]
+        now = _now()
+        details_json = json.dumps(details or {}, sort_keys=True)
+        async with self._conn() as db:
+            await db.execute(
+                """INSERT INTO project_notifications(
+                       id,project_id,vm_id,level,message,details_json,status,created_at,delivered_at
+                   ) VALUES(?,?,?,?,?,?,?,?,NULL)""",
+                (notification_id, project_id, vm_id, level, message, details_json, "pending", now),
+            )
+            await db.commit()
+        return ProjectNotification(
+            id=notification_id,
+            project_id=project_id,
+            vm_id=vm_id,
+            level=level,
+            message=message,
+            details=details or {},
+            status="pending",
+            created_at=_parse_dt(now),
+        )
+
+    async def list_pending_project_notifications(
+        self,
+        project_id: str,
+        limit: int = 5,
+    ) -> list[ProjectNotification]:
+        async with self._conn() as db:
+            async with db.execute(
+                """SELECT * FROM project_notifications
+                   WHERE project_id=? AND status='pending'
+                   ORDER BY created_at ASC
+                   LIMIT ?""",
+                (project_id, limit),
+            ) as cur:
+                rows = await cur.fetchall()
+        return [_notification_from_row(row) for row in rows]
+
+    async def mark_project_notifications_delivered(self, notification_ids: list[str]) -> None:
+        if not notification_ids:
+            return
+        placeholders = ",".join("?" for _ in notification_ids)
+        async with self._conn() as db:
+            await db.execute(
+                f"""UPDATE project_notifications
+                    SET status='delivered', delivered_at=?
+                    WHERE id IN ({placeholders})""",
+                [_now(), *notification_ids],
+            )
+            await db.commit()
 
     # --- Events ---
 

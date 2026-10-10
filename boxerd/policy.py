@@ -19,10 +19,17 @@ _OWNERSHIP_REQUIRED_ACTIONS = {
     "vm.extend_lease",
     "vm.snapshot",
     "vm.exec",
+    "vm.push_files",
+    "vm.pull",
     "vm.screenshot",
     "vm.input",
     "vm.serial_log",
     "vm.purge_ghost",
+    "android.adb",
+    "guest.sysinfo",
+    "guest.services",
+    "guest.logs",
+    "guest.packages",
 }
 
 # Actions that are always blocked unless admin

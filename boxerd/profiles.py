@@ -47,12 +47,22 @@ PROFILES: dict[str, dict] = {
 MAX_PROFILES = 5
 
 
+# Special profile handled outside the package allowlist (see boxerd/agent_inject).
+_SPECIAL_PROFILES = [
+    {
+        "name": "boxerctl",
+        "description": "Install the in-guest boxerctl agent for structured guest-utils telemetry",
+        "packages": [],
+    }
+]
+
+
 def available_profiles() -> list[dict]:
     """Return the catalog of profiles for discovery (name + description + packages)."""
     return [
         {"name": name, "description": p["description"], "packages": list(p["packages"])}
         for name, p in PROFILES.items()
-    ]
+    ] + [dict(p) for p in _SPECIAL_PROFILES]
 
 
 def resolve_profiles(names: list[str]) -> dict[str, list[str]]:

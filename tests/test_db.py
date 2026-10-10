@@ -146,3 +146,62 @@ async def test_events(db: Database) -> None:
     events = await db.list_events()
     assert len(events) >= 1
     assert events[0].message == "VM created"
+
+
+@pytest.mark.asyncio
+async def test_project_call_log_counts_and_prunes(db: Database) -> None:
+    now = datetime.now(timezone.utc)
+    await db.record_project_call("p_aaa111", "vm.get", "alice")
+    await db.record_project_call("p_aaa111", "vm.exec", "alice")
+    await db.record_project_call("p_bbb222", "vm.get", "bob")
+
+    assert await db.count_project_calls_since("p_aaa111", now - timedelta(minutes=1)) == 2
+    assert await db.count_project_calls_since("p_bbb222", now - timedelta(minutes=1)) == 1
+
+    pruned = await db.prune_project_call_log(now + timedelta(seconds=1))
+    assert pruned == 3
+    assert await db.count_project_calls_since("p_aaa111", now - timedelta(minutes=1)) == 0
+
+
+@pytest.mark.asyncio
+async def test_cleanup_action_roundtrip(db: Database) -> None:
+    await db.upsert_project("p_aaa111", "/a")
+    await db.insert_vm(_make_vm("vm_cleanup", "p_aaa111"))
+    now = datetime.now(timezone.utc)
+    force_after = now + timedelta(minutes=10)
+
+    await db.upsert_cleanup_action(
+        "vm_cleanup",
+        "p_aaa111",
+        "graceful_requested",
+        now,
+        force_after,
+        "shutdown signal failed",
+    )
+
+    action = await db.get_cleanup_action("vm_cleanup")
+    assert action is not None
+    assert action.vm_id == "vm_cleanup"
+    assert action.force_after == force_after
+    assert action.last_error == "shutdown signal failed"
+
+    await db.delete_cleanup_action("vm_cleanup")
+    assert await db.get_cleanup_action("vm_cleanup") is None
+
+
+@pytest.mark.asyncio
+async def test_project_notifications_are_delivered_explicitly(db: Database) -> None:
+    note = await db.add_project_notification(
+        "p_aaa111",
+        "WARN",
+        "forced off vm_abc",
+        vm_id="vm_abc",
+        details={"process_snapshot": {"lines": ["PID COMMAND", "1 init"]}},
+    )
+
+    pending = await db.list_pending_project_notifications("p_aaa111")
+    assert [n.id for n in pending] == [note.id]
+    assert pending[0].details["process_snapshot"]["lines"][1] == "1 init"
+
+    await db.mark_project_notifications_delivered([note.id])
+    assert await db.list_pending_project_notifications("p_aaa111") == []

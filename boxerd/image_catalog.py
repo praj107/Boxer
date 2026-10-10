@@ -110,6 +110,23 @@ def _refresh_policy(entry: dict) -> str:
     return "pinned" if entry.get("sha256") else "latest"
 
 
+def _is_transient_fetch_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is a network-transport failure that warrants falling back
+    to a previously verified cached blob.
+
+    True for connect/read/write timeouts, connection resets, and upstream 5xx
+    responses — the kind of failure a retry (or a working mirror) would clear. A
+    checksum mismatch, PGP failure, missing manifest entry, or 4xx is a real
+    error and must fail closed, so those (raised as ``IPCError`` or 4xx
+    ``HTTPStatusError``) return False.
+    """
+    if isinstance(exc, httpx.TransportError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return 500 <= exc.response.status_code < 600
+    return False
+
+
 def _validate_hash_algorithm(algorithm: str) -> str:
     normalized = algorithm.lower()
     if normalized not in _SUPPORTED_HASHES:
@@ -250,7 +267,24 @@ class ImageManager:
                 logger.debug("%s %s served from manual-pinned cache %s", kind, name, current)
                 return current
 
-        expected = await self._expected_digest(entry, url)
+        try:
+            expected = await self._expected_digest(entry, url)
+        except Exception as exc:
+            # A transient upstream failure (mirror timeout, connection reset,
+            # 5xx) must not block provisioning when a previously verified copy
+            # is already cached: 'latest' re-validates on every request, so a
+            # flaky mirror would otherwise take down an image we can already
+            # serve. Fall back to the cached current blob with a warning.
+            # Verification failures and explicit force refreshes still fail.
+            fallback = self._current_blob(meta, name, iso=iso)
+            if fallback is not None and not force and _is_transient_fetch_error(exc):
+                logger.warning(
+                    "%s %s: upstream digest refresh failed (%s); serving cached "
+                    "verified blob %s",
+                    kind, name, exc, fallback.name,
+                )
+                return fallback
+            raise
 
         if expected is not None:
             blob = self._blob_path(name, expected.algorithm, expected.digest, iso=iso)
